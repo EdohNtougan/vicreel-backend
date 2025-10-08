@@ -147,3 +147,4 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         _inference_semaphore.release()
+        
