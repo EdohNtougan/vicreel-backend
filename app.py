@@ -1,4 +1,4 @@
-# remplace entièrement app.py par ce bloc
+# app.py 
 import os
 import uuid
 import asyncio
@@ -12,7 +12,8 @@ from pydub import AudioSegment
 
 # config
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
-DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/fr/css10/vits")
+DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
+DEFAULT_LANGUAGE = os.getenv("VICREEL_DEFAULT_LANGUAGE", "fr")
 OUTPUT_DIR = os.getenv("VICREEL_OUTPUT_DIR", "outputs")
 MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
 
@@ -51,10 +52,17 @@ class TTSManager:
             logger.info(f"Model {name} loaded")
             return tts_inst
 
-    async def synth_to_wav(self, text: str, wav_path: str, model_name: str | None = None):
+    async def synth_to_wav(self, text: str, wav_path: str, model_name: str | None = None, language: str = DEFAULT_LANGUAGE, speaker_wav: str | None = None):
         tts = await self.get(model_name)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, tts.tts_to_file, text, wav_path)
+        # Pass additional params for XTTS or multilingual models
+        kwargs = {"file_path": wav_path, "text": text}
+        if "xtts" in (model_name or self.default_model).lower():
+            kwargs["language"] = language
+            if speaker_wav:
+                kwargs["speaker_wav"] = speaker_wav
+        await loop.run_in_executor(None, tts.tts_to_file, **kwargs)
+        logger.info(f"Generated audio for text: '{text[:50]}...' at {wav_path}")
 
 tts_manager = TTSManager(DEFAULT_MODEL)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -72,7 +80,7 @@ def _safe_remove(path):
 
 @app.get("/")
 def root():
-    return {"message": "VicReel Coqui TTS API", "default_model": DEFAULT_MODEL}
+    return {"message": "VicReel Coqui TTS API", "default_model": DEFAULT_MODEL, "default_language": DEFAULT_LANGUAGE}
 
 @app.get("/health")
 def health():
@@ -94,11 +102,15 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         text = body.get("text")
         fmt = body.get("format", "wav")
         model = body.get("model", None)
+        language = body.get("language", DEFAULT_LANGUAGE)
+        speaker_wav = body.get("speaker_wav", None)
     else:
         form = await request.form()
         text = form.get("text")
         fmt = form.get("format", "wav")
         model = form.get("model", None)
+        language = form.get("language", DEFAULT_LANGUAGE)
+        speaker_wav = form.get("speaker_wav", None)
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -109,7 +121,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
 
     await _inference_semaphore.acquire()
     try:
-        await tts_manager.synth_to_wav(text=text, wav_path=wav_path, model_name=model)
+        await tts_manager.synth_to_wav(text=text, wav_path=wav_path, model_name=model, language=language, speaker_wav=speaker_wav)
         if fmt != "wav":
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, _convert_wav_to_mp3, wav_path, out_path)
