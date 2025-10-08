@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from TTS.api import TTS
 from pydub import AudioSegment
+from functools import partial
 
 # config
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
@@ -18,7 +19,7 @@ MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-logging.basicConfig(level=logging.DEBUG)  # Plus de logs pour debug
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("vicreel")
 
 app = FastAPI(title="VicReel - Coqui TTS API")
@@ -47,9 +48,6 @@ class TTSManager:
             loop = asyncio.get_event_loop()
             logger.info(f"Loading model {name} (may take time)")
             tts_inst = await loop.run_in_executor(None, TTS, name)
-            # Log speakers disponibles pour debug
-            speakers = tts_inst.speakers if hasattr(tts_inst, 'speakers') else []
-            logger.debug(f"Speakers for {name}: {speakers}")
             self._models[name] = tts_inst
             logger.info(f"Model {name} loaded")
             return tts_inst
@@ -63,32 +61,25 @@ class TTSManager:
             if speaker_wav:
                 kwargs["speaker_wav"] = speaker_wav
             else:
-                # Correction pour XTTS : Utilise 'speaker' (pas speaker_id) pour predefined
-                speakers = tts.speakers if hasattr(tts, 'speakers') else []
+                speakers = getattr(tts, 'speakers', [])
                 if speakers:
-                    kwargs["speaker"] = speakers[0]  # Premier speaker (ex. "Claribel Dervla")
+                    kwargs["speaker"] = speakers[0]
                     logger.info(f"Using default speaker: {kwargs['speaker']}")
                 else:
                     raise ValueError("No speakers available for XTTS. Provide speaker_wav.")
-        try:
-            logger.debug(f"Calling tts_to_file with kwargs: {kwargs}")
-            await loop.run_in_executor(None, tts.tts_to_file, **kwargs)
-            logger.info(f"Generated audio at {wav_path}")
-        except Exception as e:
-            logger.error(f"TTS generation error: {str(e)}")
-            raise
+        logger.debug(f"Prepared kwargs: {kwargs}")
+        func = partial(tts.tts_to_file, **kwargs)
+        await loop.run_in_executor(None, func)
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
+            raise RuntimeError(f"Generated file {wav_path} is empty or too small")
+        logger.info(f"Generated audio at {wav_path}")
 
 tts_manager = TTSManager(DEFAULT_MODEL)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 def _convert_wav_to_mp3(src, dst):
-    try:
-        audio = AudioSegment.from_wav(src)
-        audio.export(dst, format="mp3")
-        logger.info(f"Converted {src} to {dst}")
-    except Exception as e:
-        logger.error(f"Conversion error: {str(e)}")
-        raise
+    audio = AudioSegment.from_wav(src)
+    audio.export(dst, format="mp3")
 
 def _safe_remove(path):
     try:
