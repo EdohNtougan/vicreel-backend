@@ -1,4 +1,4 @@
-# remplace entièrement app.py par ce bloc
+# app.py
 import os
 import uuid
 import asyncio
