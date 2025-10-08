@@ -1,4 +1,3 @@
-# app.py
 import os
 import uuid
 import asyncio
@@ -19,7 +18,7 @@ MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)  # Plus de logs pour debug
 logger = logging.getLogger("vicreel")
 
 app = FastAPI(title="VicReel - Coqui TTS API")
@@ -47,14 +46,13 @@ class TTSManager:
                 return self._models[name]
             loop = asyncio.get_event_loop()
             logger.info(f"Loading model {name} (may take time)")
-            try:
-                tts_inst = await loop.run_in_executor(None, TTS, name)
-                self._models[name] = tts_inst
-                logger.info(f"Model {name} loaded")
-                return tts_inst
-            except Exception as e:
-                logger.error(f"Error loading model {name}: {e}")
-                raise
+            tts_inst = await loop.run_in_executor(None, TTS, name)
+            # Log speakers disponibles pour debug
+            speakers = tts_inst.speakers if hasattr(tts_inst, 'speakers') else []
+            logger.debug(f"Speakers for {name}: {speakers}")
+            self._models[name] = tts_inst
+            logger.info(f"Model {name} loaded")
+            return tts_inst
 
     async def synth_to_wav(self, text: str, wav_path: str, model_name: str | None = None, language: str = DEFAULT_LANGUAGE, speaker_wav: str | None = None):
         tts = await self.get(model_name)
@@ -65,16 +63,17 @@ class TTSManager:
             if speaker_wav:
                 kwargs["speaker_wav"] = speaker_wav
             else:
-                # Correction for XTTS: Use default speaker_id if no speaker_wav
+                # Correction pour XTTS : Utilise 'speaker' (pas speaker_id) pour predefined
                 speakers = tts.speakers if hasattr(tts, 'speakers') else []
                 if speakers:
-                    kwargs["speaker_id"] = speakers[0]  # First available speaker (e.g., "Claribel Dervla")
-                    logger.info(f"Using default speaker_id: {kwargs['speaker_id']}")
+                    kwargs["speaker"] = speakers[0]  # Premier speaker (ex. "Claribel Dervla")
+                    logger.info(f"Using default speaker: {kwargs['speaker']}")
                 else:
-                    raise ValueError("No speakers available for XTTS model. Provide speaker_wav.")
+                    raise ValueError("No speakers available for XTTS. Provide speaker_wav.")
         try:
+            logger.debug(f"Calling tts_to_file with kwargs: {kwargs}")
             await loop.run_in_executor(None, tts.tts_to_file, **kwargs)
-            logger.info(f"Generated audio for text: '{text[:50]}...' at {wav_path}")
+            logger.info(f"Generated audio at {wav_path}")
         except Exception as e:
             logger.error(f"TTS generation error: {str(e)}")
             raise
@@ -83,8 +82,13 @@ tts_manager = TTSManager(DEFAULT_MODEL)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 def _convert_wav_to_mp3(src, dst):
-    audio = AudioSegment.from_wav(src)
-    audio.export(dst, format="mp3")
+    try:
+        audio = AudioSegment.from_wav(src)
+        audio.export(dst, format="mp3")
+        logger.info(f"Converted {src} to {dst}")
+    except Exception as e:
+        logger.error(f"Conversion error: {str(e)}")
+        raise
 
 def _safe_remove(path):
     try:
