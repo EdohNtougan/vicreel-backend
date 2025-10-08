@@ -1,4 +1,3 @@
-# app.py 
 import os
 import uuid
 import asyncio
@@ -55,12 +54,16 @@ class TTSManager:
     async def synth_to_wav(self, text: str, wav_path: str, model_name: str | None = None, language: str = DEFAULT_LANGUAGE, speaker_wav: str | None = None):
         tts = await self.get(model_name)
         loop = asyncio.get_event_loop()
-        # Pass additional params for XTTS or multilingual models
         kwargs = {"file_path": wav_path, "text": text}
         if "xtts" in (model_name or self.default_model).lower():
             kwargs["language"] = language
             if speaker_wav:
                 kwargs["speaker_wav"] = speaker_wav
+            else:
+                # Correction XTTS : speaker_id par défaut si pas de clonage
+                speakers = tts.speakers if hasattr(tts, 'speakers') else ["default"]
+                kwargs["speaker_id"] = speakers[0] if speakers else "default"
+                logger.info(f"Using default speaker_id: {kwargs['speaker_id']}")
         await loop.run_in_executor(None, tts.tts_to_file, **kwargs)
         logger.info(f"Generated audio for text: '{text[:50]}...' at {wav_path}")
 
