@@ -1,5 +1,4 @@
-# Dockerfile
-# --- Étape 1 : Image de base légère avec Python 3.12 ---
+# --- Dockerfile ---
 FROM python:3.12-slim
 
 # --- Configuration du répertoire de travail ---
@@ -19,7 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --- Copie du reste du projet ---
 COPY . .
 
-# --- Variables d’environnement ---
+# --- Variables d’environnement (optimisations pour Cloud Run) ---
+ENV HOSTNAME=0.0.0.0
+ENV UVICORN_WORKERS=1
+ENV LOG_LEVEL=info
+ENV TRANSFORMS_CACHE=/app/.cache/huggingface/transformers
 ENV VICREEL_API_KEY=${VICREEL_API_KEY}
 ENV VICREEL_DEFAULT_MODEL=tts_models/multilingual/multi-dataset/xtts_v2
 ENV VICREEL_DEFAULT_LANGUAGE=fr
@@ -30,4 +33,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
 
 # --- Commande de lancement (utilise $PORT pour Cloud Run) ---
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "$PORT"]
+CMD ["uvicorn", "app:app", "--host", "${HOSTNAME}", "--port", "$PORT", "--workers", "$UVICORN_WORKERS", "--log-level", "$LOG_LEVEL"]
