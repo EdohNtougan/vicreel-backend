@@ -1,4 +1,4 @@
-# remplace entièrement Dockerfile par ce bloc
+# Dockerfile
 # --- Étape 1 : Image de base légère avec Python 3.12 ---
 FROM python:3.12-slim
 
