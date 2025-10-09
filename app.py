@@ -1,4 +1,3 @@
-# app.py
 import os
 import uuid
 import asyncio
@@ -61,8 +60,8 @@ class TTSManager:
             speakers = getattr(tts, 'speakers', [])
             speaker = speakers[0] if speakers else None
             logger.info(f"XTTS speakers: {speakers[:5]}..., using speaker: {speaker}")
-            # Explicit args for XTTS to avoid **kwargs issues in executor
-            await loop.run_in_executor(None, tts.tts_to_file, text, wav_path, language=language, speaker_wav=speaker_wav, speaker=speaker)
+            # Explicit positional args for XTTS to avoid **kwargs issues in executor
+            await loop.run_in_executor(None, tts.tts_to_file, text, wav_path, speaker=speaker, language=language, speaker_wav=speaker_wav)
         else:
             # Standard for other models
             await loop.run_in_executor(None, tts.tts_to_file, text, wav_path)
@@ -100,7 +99,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "loaded_models": list(tts_manager._models.keys())}
+    return {"status": "ok"}  # Lightweight for startup probe – no model load
 
 @app.post("/models/download", dependencies=[Depends(verify_api_key)])
 async def download_model(body: dict):
