@@ -1,4 +1,4 @@
-# Dockerfile
+# remplace entièrement Dockerfile par ce bloc
 # --- Étape 1 : Image de base légère avec Python 3.12 ---
 FROM python:3.12-slim
 
@@ -10,13 +10,13 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
-# --- fichiers nécessaires ---
+# --- Copie des fichiers nécessaires ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- le reste du projet ---
+# --- Copie du reste du projet ---
 COPY . .
 
 # --- Variables d’environnement ---
@@ -26,8 +26,8 @@ ENV VICREEL_DEFAULT_LANGUAGE=fr
 ENV VICREEL_MAX_CONCURRENCY=1
 ENV PYTHONUNBUFFERED=1
 
-# --- le port ---
-EXPOSE 8000
+# --- Expose le port (défaut pour Cloud Run) ---
+EXPOSE 8080
 
-# --- Commande de lancement ---
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# --- Commande de lancement (utilise $PORT pour Cloud Run) ---
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "$PORT"]
