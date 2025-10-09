@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from TTS.api import TTS
 from pydub import AudioSegment
+from functools import partial
 
 # config
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
@@ -100,7 +101,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "loaded_models": list(tts_manager._models.keys())}
+    return {"status": "ok"}  # Lightweight for startup probe – no model load
 
 @app.post("/models/download", dependencies=[Depends(verify_api_key)])
 async def download_model(body: dict):
