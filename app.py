@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from TTS.api import TTS
 from pydub import AudioSegment
-from functools import partial
 
 # config
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
