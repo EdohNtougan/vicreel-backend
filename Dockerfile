@@ -30,8 +30,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # --- Commande de lancement ---
-<<<<<<< HEAD
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-=======
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
->>>>>>> b9456a8f92b8725b50ae06736d0659cf64f12a03
