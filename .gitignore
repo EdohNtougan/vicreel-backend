@@ -6,4 +6,8 @@ outputs/
 models/
 *.wav
 *.mp3
+<<<<<<< HEAD
 .DS_Store
+=======
+.DS_Store
+>>>>>>> b9456a8f92b8725b50ae06736d0659cf64f12a03
