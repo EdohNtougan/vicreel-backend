@@ -1,3 +1,4 @@
+# app.py
 import os
 import uuid
 import asyncio
@@ -8,7 +9,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from TTS.api import TTS
 from pydub import AudioSegment
-from functools import partial
 
 # config
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
@@ -55,31 +55,37 @@ class TTSManager:
     async def synth_to_wav(self, text: str, wav_path: str, model_name: str | None = None, language: str = DEFAULT_LANGUAGE, speaker_wav: str | None = None):
         tts = await self.get(model_name)
         loop = asyncio.get_event_loop()
-        kwargs = {"text": text, "file_path": wav_path}
-        if "xtts" in (model_name or self.default_model).lower():
-            kwargs["language"] = language
-            if speaker_wav:
-                kwargs["speaker_wav"] = speaker_wav
-            else:
-                speakers = getattr(tts, 'speakers', [])
-                if speakers:
-                    kwargs["speaker"] = speakers[0]
-                    logger.info(f"Using default speaker: {kwargs['speaker']}")
-                else:
-                    raise ValueError("No speakers available for XTTS. Provide speaker_wav.")
-        logger.debug(f"Prepared kwargs: {kwargs}")
-        func = partial(tts.tts_to_file, **kwargs)
-        await loop.run_in_executor(None, func)
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
-            raise RuntimeError(f"Generated file {wav_path} is empty or too small")
-        logger.info(f"Generated audio at {wav_path}")
+        logger.debug(f"Synth params: text='{text[:50]}...', model='{model_name or DEFAULT_MODEL}', language='{language}', speaker_wav='{speaker_wav}'")
+        is_xtts = "xtts" in (model_name or self.default_model).lower()
+        if is_xtts:
+            speakers = getattr(tts, 'speakers', [])
+            speaker = speakers[0] if speakers else None
+            logger.info(f"XTTS speakers: {speakers[:5]}..., using speaker: {speaker}")
+            # Explicit args for XTTS to avoid **kwargs issues in executor
+            await loop.run_in_executor(None, tts.tts_to_file, text, wav_path, language=language, speaker_wav=speaker_wav, speaker=speaker)
+        else:
+            # Standard for other models
+            await loop.run_in_executor(None, tts.tts_to_file, text, wav_path)
+        # Check file after generation
+        if not os.path.exists(wav_path):
+            raise RuntimeError(f"File not created: {wav_path}")
+        size = os.path.getsize(wav_path)
+        logger.info(f"Generated audio at {wav_path}, size: {size} bytes")
+        if size < 1000:
+            raise RuntimeError(f"Generated file too small ({size} bytes) – TTS failed silently")
+        logger.debug(f"Audio generation successful, duration check: {size > 5000}")
 
 tts_manager = TTSManager(DEFAULT_MODEL)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
 def _convert_wav_to_mp3(src, dst):
-    audio = AudioSegment.from_wav(src)
-    audio.export(dst, format="mp3")
+    try:
+        audio = AudioSegment.from_wav(src)
+        audio.export(dst, format="mp3")
+        logger.info(f"Converted {src} to {dst}, size: {os.path.getsize(dst)} bytes")
+    except Exception as e:
+        logger.error(f"Conversion error: {str(e)}")
+        raise
 
 def _safe_remove(path):
     try:
@@ -124,6 +130,8 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
+
+    logger.debug(f"TTS request: text='{text[:50]}...', fmt='{fmt}', model='{model}', language='{language}'")
 
     job_id = uuid.uuid4().hex
     wav_path = os.path.join(OUTPUT_DIR, f"{job_id}.wav")
