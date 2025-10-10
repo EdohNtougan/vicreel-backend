@@ -27,7 +27,7 @@ ENV VICREEL_MAX_CONCURRENCY=1
 ENV PYTHONUNBUFFERED=1
 
 # --- le port ---
-EXPOSE 8000
+EXPOSE 8080
 
 # --- Commande de lancement ---
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
