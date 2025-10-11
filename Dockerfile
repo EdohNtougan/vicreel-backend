@@ -1,4 +1,3 @@
-# Dockerfile
 # --- Étape 1 : Image de base légère avec Python 3.12 ---
 FROM python:3.12-slim
 
@@ -10,24 +9,29 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
-# --- fichiers nécessaires ---
+# --- Copie des fichiers nécessaires ---
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- le reste du projet ---
+# --- Copie du cache modèle XTTS pour éviter download dans l'image ---
+RUN mkdir -p /root/.cache/huggingface/tts
+COPY ~/.cache/huggingface/tts /root/.cache/huggingface/tts
+
+# --- Copie du reste du projet ---
 COPY . .
 
-# --- Variables d’environnement ---
+# --- Variables d’environnement (fix TOS, port, etc.) ---
+ENV COQUI_TOS_AGREED=1
 ENV VICREEL_API_KEY=${VICREEL_API_KEY}
 ENV VICREEL_DEFAULT_MODEL=tts_models/multilingual/multi-dataset/xtts_v2
 ENV VICREEL_DEFAULT_LANGUAGE=fr
 ENV VICREEL_MAX_CONCURRENCY=1
 ENV PYTHONUNBUFFERED=1
 
-# --- le port ---
+# --- Expose le port (défaut pour Cloud Run) ---
 EXPOSE 8080
 
-# --- Commande de lancement ---
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+# --- Commande de lancement (utilise $PORT pour Cloud Run) ---
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
