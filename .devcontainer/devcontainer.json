@@ -3,6 +3,12 @@
   "features": {},
   "hostRequirements": {
     "cpus": 8,
-    "memory": "32gb"
+    "memory": "32gb", // RAM standard pour 8 cœurs
+    "storage": "64gb" // Stockage spécifié
+  },
+  "customizations": {
+    "codespaces": {
+      "machineType": "standardLinux.8cores"
+    }
   }
 }
