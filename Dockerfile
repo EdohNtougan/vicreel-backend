@@ -1,26 +1,46 @@
-# Dockerfile - pour vikedoh / vicreel-api
-
-FROM python:3.12-slim
+# =========================
+# 1) STAGE DE BUILD
+# =========================
+FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-# Dépendances système
+# Dépendances système nécessaires
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copier et installer dépendances Python
+# Copie requirements
 COPY requirements.txt .
+
+# Upgrade pip et installation torch + dépendances
 RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Créer la structure attendue pour Coqui / TTS et copier le modèle depuis le contexte
-RUN mkdir -p /root/.local/share/tts/tts_models/multilingual/multi-dataset
-COPY models/xtts/tts_models--multilingual--multi-dataset--xtts_v2 \
-    /root/.local/share/tts/tts_models/multilingual/multi-dataset/xtts_v2
+# Téléchargement automatique du modèle XTTS-v2 pendant le build
+ENV COQUI_TOS_AGREED=1
+RUN python3 -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)"
 
-# Copier le code de l'application
+# =========================
+# 2) STAGE FINAL
+# =========================
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Installer ffmpeg et dépendances système
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copier les paquets Python depuis le builder
+COPY --from=builder /usr/local /usr/local
+
+# Copier le modèle XTTS téléchargé
+COPY --from=builder /root/.local/share/tts /root/.local/share/tts
+
+# Copier le code source
 COPY . .
 
 # Variables d'environnement
