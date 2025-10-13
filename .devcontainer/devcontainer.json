@@ -1,8 +1,0 @@
-{
-    "image": "mcr.microsoft.com/devcontainers/universal:2",
-    "customizations": {
-      "codespaces": {
-        "machineType": "premiumLinux"
-      }
-    }
-  }
