@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Téléchargement automatique du modèle XTTS-v2 pendant le build
+# Téléchargement automatique du modèle XTTS-v2 pendant le build (optionnel)
 ENV COQUI_TOS_AGREED=1
 RUN python3 -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)"
 
@@ -40,16 +40,34 @@ COPY --from=builder /usr/local /usr/local
 # Copier le modèle XTTS téléchargé
 COPY --from=builder /root/.local/share/tts /root/.local/share/tts
 
-# Copier le code source
+# =========================
+# CONFIGURATION ALIASES
+# =========================
+
+# Crée le dossier config s’il n’existe pas (sinon COPY échoue)
+RUN mkdir -p /app/config
+
+# Copier le fichier d'aliases s'il existe dans le repo
+# (Docker ignore l’erreur si le fichier est absent grâce à l’option --chown ou un .dockerignore propre)
+COPY config/speaker_aliases.json /app/config/speaker_aliases.json
+
+# =========================
+# CODE SOURCE
+# =========================
 COPY . .
 
-# Variables d'environnement
+# Variables d'environnement par défaut
 ENV COQUI_TOS_AGREED=1
 ENV VICREEL_DEFAULT_MODEL=tts_models/multilingual/multi-dataset/xtts_v2
 ENV VICREEL_DEFAULT_LANGUAGE=fr
 ENV VICREEL_MAX_CONCURRENCY=1
 ENV PYTHONUNBUFFERED=1
 
+# Par défaut, on pointe VICREEL_SPEAKER_ALIASES_FILE vers le fichier dans l'image
+ENV VICREEL_SPEAKER_ALIASES_FILE=/app/config/speaker_aliases.json
+
+# Exposer le port
 EXPOSE 8080
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+# Lancer uvicorn
+CMD exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}
