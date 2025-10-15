@@ -4,3 +4,5 @@ coqui-tts==0.27.2
 pydub
 soundfile
 python-multipart
+torch
+transformers==4.35.2
