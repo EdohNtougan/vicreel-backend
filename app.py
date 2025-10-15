@@ -22,6 +22,8 @@ DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/mult
 DEFAULT_LANGUAGE = os.getenv("VICREEL_DEFAULT_LANGUAGE", "fr")
 OUTPUT_DIR = os.getenv("VICREEL_OUTPUT_DIR", "outputs")
 MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
+# Maximum text length limit (default 4000, override via env)
+MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "4000"))
 
 # Path to aliases file (prioritized). You can override with env var.
 ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "/app/config/speaker_aliases.json")
@@ -75,30 +77,78 @@ class TTSManager:
             logger.info(f"Model {name} loaded")
             return tts_inst
 
-    async def synth_to_wav(self, text: str, wav_path: str, model_name: Optional[str] = None, language: str = DEFAULT_LANGUAGE, speaker_wav: Optional[str] = None):
+    async def get_all_speakers(self, model_name: Optional[str] = None):
+        tts = await self.get(model_name)
+        return getattr(tts, 'speakers', []) or getattr(tts, 'voices', []) or []
+
+    async def synth_to_wav(
+        self,
+        text: str,
+        wav_path: str,
+        model_name: Optional[str] = None,
+        language: str = DEFAULT_LANGUAGE,
+        speaker_wav: Optional[str] = None,
+        speaker: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Synthesizes text to WAV file.
+        - speaker_wav: path to a reference wav for xtts voice cloning
+        - speaker: speaker id (from model) to use
+        - options: additional kwargs to pass to tts.tts_to_file (filtered)
+        """
         tts = await self.get(model_name)
         loop = asyncio.get_event_loop()
         effective_model = (model_name or self.default_model).lower()
 
-        # Prepare kwargs according to model type
-        kwargs = {"text": text, "file_path": wav_path}
+        # Base kwargs
+        kwargs: Dict[str, Any] = {"text": text, "file_path": wav_path}
+
+        # XTTS specific: language and speaker selection
         if "xtts" in effective_model:
             kwargs["language"] = language
+            # priority: speaker_wav -> explicit speaker id -> default speakers list
             if speaker_wav:
                 kwargs["speaker_wav"] = speaker_wav
+            elif speaker:
+                kwargs["speaker"] = speaker
             else:
                 speakers = getattr(tts, 'speakers', []) or getattr(tts, 'voices', [])
                 if speakers:
-                    # pick the first available speaker/voice
                     kwargs["speaker"] = speakers[0]
                     logger.info(f"Using default speaker: {kwargs['speaker']}")
                 else:
-                    # Fallback: don't set speaker, let model decide
                     logger.warning("No speakers/voices attribute found on model; proceeding without explicit speaker")
+        else:
+            # For non-XTTS models, allow passing a speaker if supported
+            if speaker:
+                kwargs["speaker"] = speaker
+
+        # Merge 'options' into kwargs after filtering supported keys to avoid TypeError
+        if options:
+            func = getattr(tts, 'tts_to_file', None)
+            if func is None:
+                logger.warning("Model does not expose tts_to_file; ignoring options.")
+            else:
+                try:
+                    sig = inspect.signature(func)
+                    supported = set(sig.parameters.keys())
+                    # Keep only supported option keys
+                    filtered = {k: v for k, v in options.items() if k in supported}
+                    if filtered:
+                        kwargs.update(filtered)
+                    else:
+                        logger.debug(f"No provided options were supported by tts_to_file: {list(options.keys())}")
+                except Exception as e:
+                    logger.exception(f"Failed to inspect tts_to_file signature: {e}")
 
         logger.debug(f"Prepared tts kwargs: {kwargs}")
-        func = partial(getattr(tts, 'tts_to_file', tts.tts_to_file), **kwargs)
-        await loop.run_in_executor(None, func)
+
+        # Run blocking tts_to_file in executor
+        func = getattr(tts, 'tts_to_file', None)
+        if func is None:
+            raise RuntimeError("Model object does not implement tts_to_file")
+        await loop.run_in_executor(None, partial(func, **kwargs))
 
         # Validate generated file
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
@@ -113,8 +163,6 @@ _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 # -------------------
 # Aliases: prefer file-based aliases if available, otherwise read from env
 # -------------------
-ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "/app/config/speaker_aliases.json")
-
 def _is_valid_alias_map(obj) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -305,6 +353,17 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
+    # ---------- NEW: enforce maximum text length ----------
+    if len(text) > MAX_TEXT_LENGTH:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Le texte fourni dépasse la limite de {MAX_TEXT_LENGTH} caractères.",
+                "actual_length": len(text)
+            }
+        )
+    # -----------------------------------------------------
+
     if fmt not in ("wav", "mp3"):
         raise HTTPException(status_code=400, detail="format must be 'wav' or 'mp3'")
 
@@ -321,10 +380,17 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
 
     await _inference_semaphore.acquire()
     try:
-        await tts_manager.synth_to_wav(text=text, wav_path=wav_path, model_name=model, language=language, speaker_wav=speaker_wav)
-        # Note: synth_to_wav currently selects default speaker if none provided; to pass explicit speaker,
-        # you can modify TTSManager.synth_to_wav signature and call accordingly.
-        # For now, if you want to pass the resolved speaker id into synth_to_wav, set speaker_wav or update call.
+        # pass speaker and options into synth_to_wav (new signature)
+        await tts_manager.synth_to_wav(
+            text=text,
+            wav_path=wav_path,
+            model_name=model,
+            language=language,
+            speaker_wav=speaker_wav,
+            speaker=speaker,
+            options=options
+        )
+
         if fmt != "wav":
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, _convert_wav_to_mp3, wav_path, out_path)
