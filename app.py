@@ -1,10 +1,14 @@
+# app.py — VicReel (version avec timeout, purge, metrics, rate-limit, executor pool)
 import os
 import uuid
 import asyncio
 import logging
 import json
 import inspect
+import time
 from typing import Optional, Dict, Any
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -15,51 +19,127 @@ from pydub import AudioSegment
 from functools import partial
 
 # -------------------
-# Configuration
+# Configuration (env-overridable)
 # -------------------
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
 DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
 DEFAULT_LANGUAGE = os.getenv("VICREEL_DEFAULT_LANGUAGE", "fr")
 OUTPUT_DIR = os.getenv("VICREEL_OUTPUT_DIR", "outputs")
 MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
-# Maximum text length limit (default 4000, override via env)
+
+# Text length limit
 MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "4000"))
+
+# Timeout for a single synth call (seconds)
+SYNTH_TIMEOUT_SECONDS = int(os.getenv("VICREEL_SYNTH_TIMEOUT", "60"))
+
+# Executor workers for CPU-bound TTS calls
+EXECUTOR_WORKERS = int(os.getenv("VICREEL_EXECUTOR_WORKERS", "4"))
+
+# File cleanup settings
+PERSIST_OUTPUT_MAX_AGE = int(os.getenv("VICREEL_OUTPUT_MAX_AGE", str(60 * 10)))  # seconds; default 10 minutes
+PERSIST_OUTPUT_MAX_FILES = int(os.getenv("VICREEL_OUTPUT_MAX_FILES", "100"))  # max files to keep
+
+# Rate limiting (per API key): window seconds and max requests in window
+RATE_LIMIT_WINDOW = int(os.getenv("VICREEL_RATE_LIMIT_WINDOW", "60"))  # seconds
+RATE_LIMIT_MAX = int(os.getenv("VICREEL_RATE_LIMIT_MAX", "30"))  # requests per window per key
 
 # Path to aliases file (prioritized). You can override with env var.
 ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "/app/config/speaker_aliases.json")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Logging
+# -------------------
+# Logging - basic + structured JSON helper
+# -------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vicreel")
 
-# FastAPI App
+def log_event(level: str, payload: dict):
+    """Write structured JSON log (keeps old behavior available)."""
+    try:
+        entry = {"timestamp": int(time.time()), **payload}
+        if level.lower() == "info":
+            logger.info(json.dumps(entry, ensure_ascii=False))
+        elif level.lower() == "warning":
+            logger.warning(json.dumps(entry, ensure_ascii=False))
+        elif level.lower() == "error":
+            logger.error(json.dumps(entry, ensure_ascii=False))
+        else:
+            logger.debug(json.dumps(entry, ensure_ascii=False))
+    except Exception:
+        logger.exception("Failed to write structured log")
+
+# -------------------
+# FastAPI app
+# -------------------
 app = FastAPI(title="VicReel - Coqui TTS API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# API Key dependency
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
-
 def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
-    """Validate API key. If no API key is configured on the server (empty string), accept all requests.
-    If an API key is configured, header must be present and match."""
+    """Validate API key. If no API key is configured on the server (empty string), accept all requests."""
     if not API_KEY:
         return True
     if not api_key or api_key != API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing API key")
     return True
 
+# -------------------
+# Executor pool (shared)
+# -------------------
+_executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 
 # -------------------
-# TTS Manager
+# Simple in-memory metrics
+# -------------------
+METRICS = {
+    "requests_total": 0,
+    "success_total": 0,
+    "error_total": 0,
+    "timeouts_total": 0,
+    "total_duration_seconds": 0.0,
+}
+
+# -------------------
+# Simple in-memory rate limiter (per API key)
+# Uses sliding window with deque timestamps
+# -------------------
+_rate_limit_store: Dict[str, deque] = {}
+_rate_limit_lock = asyncio.Lock()
+
+async def check_rate_limit(api_key_value: str) -> Optional[JSONResponse]:
+    """
+    Returns a JSONResponse if request must be rejected (429), otherwise None.
+    For anonymous clients (no API key), we use a shared key "ANON".
+    """
+    key = api_key_value or "ANON"
+    now = time.time()
+    async with _rate_limit_lock:
+        dq = _rate_limit_store.get(key)
+        if dq is None:
+            dq = deque()
+            _rate_limit_store[key] = dq
+        # prune timestamps older than window
+        while dq and dq[0] <= now - RATE_LIMIT_WINDOW:
+            dq.popleft()
+        if len(dq) >= RATE_LIMIT_MAX:
+            # too many requests
+            retry_after = int(RATE_LIMIT_WINDOW - (now - dq[0])) if dq else RATE_LIMIT_WINDOW
+            log_event("warning", {"event": "rate_limited", "key": key, "count": len(dq)})
+            return JSONResponse(status_code=429, content={"error": "rate limit exceeded", "retry_after": retry_after})
+        dq.append(now)
+    return None
+
+# -------------------
+# TTS Manager with executor usage and extended synth signature
 # -------------------
 class TTSManager:
-    def __init__(self, default_model: str):
+    def __init__(self, default_model: str, executor: ThreadPoolExecutor):
         self.default_model = default_model
         self._models: dict[str, TTS] = {}
         self._lock = asyncio.Lock()
+        self._executor = executor
 
     async def get(self, model_name: Optional[str] = None) -> TTS:
         name = model_name or self.default_model
@@ -70,9 +150,8 @@ class TTSManager:
                 return self._models[name]
             loop = asyncio.get_event_loop()
             logger.info(f"Loading model {name} (this may take some time)")
-            # Use partial to call the TTS constructor in a threadpool
             ctor = partial(TTS, name)
-            tts_inst = await loop.run_in_executor(None, ctor)
+            tts_inst = await loop.run_in_executor(self._executor, ctor)
             self._models[name] = tts_inst
             logger.info(f"Model {name} loaded")
             return tts_inst
@@ -91,23 +170,14 @@ class TTSManager:
         speaker: Optional[str] = None,
         options: Optional[Dict[str, Any]] = None
     ):
-        """
-        Synthesizes text to WAV file.
-        - speaker_wav: path to a reference wav for xtts voice cloning
-        - speaker: speaker id (from model) to use
-        - options: additional kwargs to pass to tts.tts_to_file (filtered)
-        """
         tts = await self.get(model_name)
         loop = asyncio.get_event_loop()
         effective_model = (model_name or self.default_model).lower()
 
-        # Base kwargs
+        # Build kwargs
         kwargs: Dict[str, Any] = {"text": text, "file_path": wav_path}
-
-        # XTTS specific: language and speaker selection
         if "xtts" in effective_model:
             kwargs["language"] = language
-            # priority: speaker_wav -> explicit speaker id -> default speakers list
             if speaker_wav:
                 kwargs["speaker_wav"] = speaker_wav
             elif speaker:
@@ -120,48 +190,42 @@ class TTSManager:
                 else:
                     logger.warning("No speakers/voices attribute found on model; proceeding without explicit speaker")
         else:
-            # For non-XTTS models, allow passing a speaker if supported
             if speaker:
                 kwargs["speaker"] = speaker
 
-        # Merge 'options' into kwargs after filtering supported keys to avoid TypeError
+        # Merge options (filtering supported kwargs)
         if options:
             func = getattr(tts, 'tts_to_file', None)
-            if func is None:
-                logger.warning("Model does not expose tts_to_file; ignoring options.")
-            else:
+            if func:
                 try:
                     sig = inspect.signature(func)
                     supported = set(sig.parameters.keys())
-                    # Keep only supported option keys
                     filtered = {k: v for k, v in options.items() if k in supported}
                     if filtered:
                         kwargs.update(filtered)
-                    else:
-                        logger.debug(f"No provided options were supported by tts_to_file: {list(options.keys())}")
-                except Exception as e:
-                    logger.exception(f"Failed to inspect tts_to_file signature: {e}")
+                except Exception:
+                    logger.exception("Failed to inspect tts_to_file signature; ignoring options")
+            else:
+                logger.warning("Model has no tts_to_file; ignoring options")
 
-        logger.debug(f"Prepared tts kwargs: {kwargs}")
+        log_event("info", {"event": "synth_prepare", "model": model_name or self.default_model, "kwargs_keys": list(kwargs.keys()), "text_len": len(text)})
 
-        # Run blocking tts_to_file in executor
+        # run in executor (use pool)
         func = getattr(tts, 'tts_to_file', None)
         if func is None:
             raise RuntimeError("Model object does not implement tts_to_file")
-        await loop.run_in_executor(None, partial(func, **kwargs))
+        await loop.run_in_executor(self._executor, partial(func, **kwargs))
 
-        # Validate generated file
+        # Validate file
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
             raise RuntimeError(f"Generated file {wav_path} is empty or too small")
-        logger.info(f"Generated audio at {wav_path}")
+        log_event("info", {"event": "synth_done", "wav_path": wav_path, "size": os.path.getsize(wav_path)})
 
-
-tts_manager = TTSManager(DEFAULT_MODEL)
+tts_manager = TTSManager(DEFAULT_MODEL, _executor)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-
 # -------------------
-# Aliases: prefer file-based aliases if available, otherwise read from env
+# Aliases loader/persistence (unchanged)
 # -------------------
 def _is_valid_alias_map(obj) -> bool:
     if not isinstance(obj, dict):
@@ -207,10 +271,6 @@ def _load_aliases_from_env() -> Dict[str, str]:
     return {}
 
 def _save_aliases_to_file(path: str, aliases: Dict[str, str]):
-    """
-    Atomic save: write to temp file then os.replace -> avoids corrupt file.
-    If filesystem is read-only or not writable, raise/log but keep changes in-memory.
-    """
     try:
         dirp = os.path.dirname(path)
         if dirp and not os.path.exists(dirp):
@@ -227,28 +287,22 @@ def _save_aliases_to_file(path: str, aliases: Dict[str, str]):
     except Exception as e:
         logger.exception(f"Failed to write aliases file {path}: {e}")
 
-# Load aliases: priority -> file, then env var, else empty map
 SPEAKER_ALIASES = _load_aliases_from_file(ALIASES_FILE_PATH)
 if not SPEAKER_ALIASES:
     SPEAKER_ALIASES = _load_aliases_from_env()
-# At this point SPEAKER_ALIASES is a validated dict (possibly empty)
 logger.info(f"Effective speaker aliases loaded: {len(SPEAKER_ALIASES)} entries (file priority: {ALIASES_FILE_PATH})")
 
-
 def _apply_alias(speaker_id: str) -> str:
-    """Return display name for a speaker id (alias if exists)."""
     if not speaker_id:
         return speaker_id
     return SPEAKER_ALIASES.get(speaker_id, speaker_id)
 
-
 # -------------------
-# Helpers
+# Helpers: convert & safe remove & purge old files
 # -------------------
 def _convert_wav_to_mp3(src: str, dst: str):
     audio = AudioSegment.from_wav(src)
     audio.export(dst, format="mp3")
-
 
 def _safe_remove(path: str):
     try:
@@ -258,6 +312,46 @@ def _safe_remove(path: str):
     except Exception as e:
         logger.warning(f"Could not delete {path}: {e}")
 
+def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_AGE, max_files: int = PERSIST_OUTPUT_MAX_FILES):
+    """
+    Remove files older than max_age_seconds. If there are more than max_files,
+    remove oldest until count <= max_files.
+    """
+    try:
+        now = time.time()
+        entries = []
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                try:
+                    mtime = os.path.getmtime(path)
+                    size = os.path.getsize(path)
+                    entries.append((path, mtime, size))
+                except Exception:
+                    continue
+        # Remove old files
+        removed = 0
+        for path, mtime, _ in entries:
+            if now - mtime > max_age_seconds:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except Exception:
+                    pass
+        # Enforce max files by removing oldest
+        entries = sorted(entries, key=lambda x: x[1])  # oldest first
+        if len(entries) - removed > max_files:
+            excess = (len(entries) - removed) - max_files
+            for i in range(excess):
+                path = entries[i][0]
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        if removed:
+            log_event("info", {"event": "cleanup_old_files", "removed": removed})
+    except Exception:
+        logger.exception("cleanup_old_files failed")
 
 # -------------------
 # Routes
@@ -266,11 +360,14 @@ def _safe_remove(path: str):
 def root():
     return {"message": "VicReel Coqui TTS API", "default_model": DEFAULT_MODEL, "default_language": DEFAULT_LANGUAGE}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "loaded_models": list(tts_manager._models.keys())}
 
+@app.get("/metrics")
+def metrics_endpoint():
+    # return metrics simple JSON
+    return METRICS
 
 @app.post("/models/download", dependencies=[Depends(verify_api_key)])
 async def download_model(body: dict):
@@ -280,55 +377,45 @@ async def download_model(body: dict):
     await tts_manager.get(model)
     return {"status": "ok", "model": model}
 
-
 @app.get("/voices", dependencies=[Depends(verify_api_key)])
 async def list_voices(model: Optional[str] = None):
-    """
-    Return available voices/speakers for the model (speaker id + display name).
-    """
     tts = await tts_manager.get(model)
     speakers = getattr(tts, 'speakers', []) or getattr(tts, 'voices', []) or []
     result = [{"id": s, "display_name": _apply_alias(s)} for s in speakers]
     return {"model": model or DEFAULT_MODEL, "voices": result, "count": len(result)}
 
-
 @app.get("/languages", dependencies=[Depends(verify_api_key)])
 async def list_languages(model: Optional[str] = None):
-    """
-    Return languages supported by the model when available.
-    """
     tts = await tts_manager.get(model)
     langs = getattr(tts, 'languages', None) or getattr(tts, 'supported_languages', None)
     if not langs:
-        # fallback to commonly supported languages for XTTS-v2
         langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja"]
     return {"model": model or DEFAULT_MODEL, "languages": langs}
 
-
 @app.post("/voices/aliases", dependencies=[Depends(verify_api_key)])
 async def update_aliases(body: Dict[str, str]):
-    """
-    Update speaker aliases at runtime (protected by API key).
-    Body : {"speaker_id": "Display Name", ...}
-    This will update in-memory mapping and persist to the aliases file if writable.
-    """
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="JSON body expected as mapping speaker_id->display_name")
-    # Merge into in-memory aliases
     SPEAKER_ALIASES.update(body)
     logger.info(f"Updated {len(body)} speaker aliases (in-memory)")
-
-    # Try to persist to file (if path is writable/available)
     try:
         _save_aliases_to_file(ALIASES_FILE_PATH, SPEAKER_ALIASES)
     except Exception:
         logger.warning("Could not persist aliases to file; changes remain in-memory only")
-
     return {"status": "ok", "aliases_count": len(SPEAKER_ALIASES)}
-
 
 @app.post("/tts", dependencies=[Depends(verify_api_key)])
 async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
+    # Quick rate-limit check (per API key)
+    api_key_value = request.headers.get("x-api-key")
+    rl_resp = await check_rate_limit(api_key_value)
+    if rl_resp:
+        return rl_resp
+
+    # Kick off a quick cleanup in executor so we don't block synthesis
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, cleanup_old_files, OUTPUT_DIR, PERSIST_OUTPUT_MAX_AGE, PERSIST_OUTPUT_MAX_FILES)
+
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
         body = await request.json()
@@ -337,7 +424,6 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         model = body.get("model", None)
         language = body.get("language", DEFAULT_LANGUAGE)
         speaker_wav = body.get("speaker_wav", None)
-        # Accept speaker as either real id or alias; if alias provided, map it back to real id
         speaker_input = body.get("speaker", None)
         options = body.get("options", None) or {}
     else:
@@ -353,8 +439,9 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
-    # ---------- NEW: enforce maximum text length ----------
+    # enforce maximum text length
     if len(text) > MAX_TEXT_LENGTH:
+        log_event("warning", {"event": "text_too_long", "length": len(text), "limit": MAX_TEXT_LENGTH})
         return JSONResponse(
             status_code=400,
             content={
@@ -362,7 +449,6 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
                 "actual_length": len(text)
             }
         )
-    # -----------------------------------------------------
 
     if fmt not in ("wav", "mp3"):
         raise HTTPException(status_code=400, detail="format must be 'wav' or 'mp3'")
@@ -370,7 +456,6 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     # map alias -> real id if necessary
     speaker = None
     if speaker_input:
-        # if the provided value matches a recorded alias, map back to real id
         rev_map = {v: k for k, v in SPEAKER_ALIASES.items()}
         speaker = rev_map.get(speaker_input, speaker_input)
 
@@ -378,22 +463,43 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     wav_path = os.path.join(OUTPUT_DIR, f"{job_id}.wav")
     out_path = wav_path if fmt == "wav" else os.path.join(OUTPUT_DIR, f"{job_id}.mp3")
 
+    # Metrics: count request
+    METRICS["requests_total"] += 1
+    start_ts = time.perf_counter()
+
+    # Concurrency control + timeout/cancellation
     await _inference_semaphore.acquire()
     try:
-        # pass speaker and options into synth_to_wav (new signature)
-        await tts_manager.synth_to_wav(
-            text=text,
-            wav_path=wav_path,
-            model_name=model,
-            language=language,
-            speaker_wav=speaker_wav,
-            speaker=speaker,
-            options=options
-        )
+        try:
+            # Use asyncio.wait_for to enforce synth timeout
+            await asyncio.wait_for(
+                tts_manager.synth_to_wav(
+                    text=text,
+                    wav_path=wav_path,
+                    model_name=model,
+                    language=language,
+                    speaker_wav=speaker_wav,
+                    speaker=speaker,
+                    options=options
+                ),
+                timeout=SYNTH_TIMEOUT_SECONDS
+            )
+            duration = time.perf_counter() - start_ts
+            METRICS["success_total"] += 1
+            METRICS["total_duration_seconds"] += duration
+            log_event("info", {"event": "tts_success", "duration": duration, "text_length": len(text), "model": model or DEFAULT_MODEL})
+        except asyncio.TimeoutError:
+            METRICS["timeouts_total"] += 1
+            log_event("error", {"event": "tts_timeout", "timeout_seconds": SYNTH_TIMEOUT_SECONDS, "text_length": len(text)})
+            raise HTTPException(status_code=504, detail=f"TTS synthesis timed out after {SYNTH_TIMEOUT_SECONDS} seconds")
+        except Exception as e:
+            METRICS["error_total"] += 1
+            log_event("error", {"event": "tts_error", "error": str(e)})
+            raise
 
+        # convert if necessary and return (we keep cleanup via background tasks)
         if fmt != "wav":
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _convert_wav_to_mp3, wav_path, out_path)
+            await loop.run_in_executor(_executor, _convert_wav_to_mp3, wav_path, out_path)
             background_tasks.add_task(_safe_remove, wav_path)
             background_tasks.add_task(_safe_remove, out_path)
             return FileResponse(out_path, media_type="audio/mpeg", filename=os.path.basename(out_path))
@@ -404,7 +510,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("TTS error")
+        logger.exception("TTS error (outer)")
         raise HTTPException(status_code=500, detail="Internal TTS error")
     finally:
         _inference_semaphore.release()
