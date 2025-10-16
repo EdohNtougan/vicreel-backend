@@ -31,10 +31,10 @@ OUTPUT_DIR = os.getenv("VICREEL_OUTPUT_DIR", "outputs")
 MAX_CONCURRENCY = int(os.getenv("VICREEL_MAX_CONCURRENCY", "1"))
 
 # Text length limit
-MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "4000"))
+MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "3000"))
 
 # Timeout for a single synth call (seconds)
-SYNTH_TIMEOUT_SECONDS = int(os.getenv("VICREEL_SYNTH_TIMEOUT", "120"))
+SYNTH_TIMEOUT_SECONDS = int(os.getenv("VICREEL_SYNTH_TIMEOUT", "300"))
 
 # Executor workers for CPU-bound TTS calls
 EXECUTOR_WORKERS = int(os.getenv("VICREEL_EXECUTOR_WORKERS", "4"))
@@ -48,7 +48,7 @@ RATE_LIMIT_WINDOW = int(os.getenv("VICREEL_RATE_LIMIT_WINDOW", "60"))  # seconds
 RATE_LIMIT_MAX = int(os.getenv("VICREEL_RATE_LIMIT_MAX", "30"))  # requests per window per key
 
 # Path to aliases file (prioritized). You can override with env var.
-ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "/app/config/speaker_aliases.json")
+ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "config/speaker_aliases.json")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -90,7 +90,7 @@ def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
     return True
 
 # -------------------
-# Executor pool (shared)
+# Executor pool (shared) - used only for non-TTS tasks like conversion and cleanup
 # -------------------
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 
@@ -131,6 +131,7 @@ async def check_rate_limit(api_key_value: str) -> Optional[JSONResponse]:
 
 # -------------------
 # TTS Manager with executor usage and extended synth signature
+# TTS synthesis is now synchronous to avoid thread-safety issues
 # -------------------
 class TTSManager:
     def __init__(self, default_model: str, executor: ThreadPoolExecutor):
@@ -176,7 +177,7 @@ class TTSManager:
         options: Optional[Dict[str, Any]] = None
     ):
         tts = await self.get(model_name)
-        loop = asyncio.get_event_loop()
+        # No loop needed for sync call
         effective_model = (model_name or self.default_model).lower()
 
         kwargs: Dict[str, Any] = {"text": text, "file_path": wav_path}
@@ -212,11 +213,14 @@ class TTSManager:
                 logger.warning("Model has no tts_to_file; ignoring options")
 
         log_event("info", {"event": "synth_prepare", "model": model_name or self.default_model, "kwargs_keys": list(kwargs.keys()), "text_len": len(text)})
+        logger.info(f"Synth kwargs: {kwargs}")
 
         func = getattr(tts, 'tts_to_file', None)
         if func is None:
             raise RuntimeError("Model object does not implement tts_to_file")
-        await loop.run_in_executor(self._executor, partial(func, **kwargs))
+        
+        # Synchronous call to avoid thread issues
+        func(**kwargs)
 
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
             raise RuntimeError(f"Generated file {wav_path} is empty or too small")
@@ -245,6 +249,7 @@ def _load_aliases_from_file(path: str) -> Dict[str, str]:
             data = json.load(f)
         if _is_valid_alias_map(data):
             logger.info(f"Loaded {len(data)} speaker aliases (raw) from file {path}")
+            logger.info(f"Loaded aliases: {data}")  # Added for debug
             return data
         else:
             logger.warning(f"Aliases file {path} has invalid format; expected mapping str->str. Ignoring.")
@@ -597,15 +602,24 @@ async def update_aliases(body: Dict[str, str]):
         logger.exception("Failed to rebuild alias indexes after update")
     return {"status": "ok", "aliases_count": len(RAW_SPEAKER_ALIASES)}
 
+# Cleanup counter: call cleanup every 100 TTS requests
+_cleanup_counter = 0
+_CLEANUP_INTERVAL = 100  # Every 100 requests
+
 @app.post("/tts", dependencies=[Depends(verify_api_key)])
 async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
+    global _cleanup_counter
     api_key_value = request.headers.get("x-api-key")
     rl_resp = await check_rate_limit(api_key_value)
     if rl_resp:
         return rl_resp
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, cleanup_old_files, OUTPUT_DIR, PERSIST_OUTPUT_MAX_AGE, PERSIST_OUTPUT_MAX_FILES)
+    # Call cleanup every _CLEANUP_INTERVAL requests (async via executor)
+    _cleanup_counter += 1
+    if _cleanup_counter >= _CLEANUP_INTERVAL:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_executor, cleanup_old_files, OUTPUT_DIR, PERSIST_OUTPUT_MAX_AGE, PERSIST_OUTPUT_MAX_FILES)
+        _cleanup_counter = 0
 
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -640,6 +654,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     resolved_speaker_real: Optional[str] = None
     if speaker_input:
         resolved_speaker_real = await resolve_speaker_input(speaker_input, model)
+        logger.info(f"Resolved speaker input '{speaker_input}' to '{resolved_speaker_real}'")  # Added for debug
         if not resolved_speaker_real:
             sample = []
             for ak, display in list(ALIASKEY_TO_DISPLAY.items())[:40]:
@@ -689,6 +704,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
             logger.exception("TTS error (synthesis)")
             raise HTTPException(status_code=500, detail="Internal TTS error")
 
+        loop = asyncio.get_event_loop()
         if fmt != "wav":
             await loop.run_in_executor(_executor, _convert_wav_to_mp3, wav_path, out_path)
             background_tasks.add_task(_safe_remove, wav_path)
