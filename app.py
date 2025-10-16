@@ -9,17 +9,20 @@ import time
 import re
 import unicodedata
 import difflib
+import traceback
 from typing import Optional, Dict, Any, List
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue
 
 from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
-from TTS.api import TTS
 from pydub import AudioSegment
 from functools import partial
+
+# NOTE: TTS import is done lazily inside worker or manager to avoid heavy import at module load
 
 # -------------------
 # Configuration (env-overridable)
@@ -36,7 +39,7 @@ MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "3000"))
 # Timeout for a single synth call (seconds)
 SYNTH_TIMEOUT_SECONDS = int(os.getenv("VICREEL_SYNTH_TIMEOUT", "300"))
 
-# Executor workers for CPU-bound TTS calls
+# Executor workers for CPU-bound TTS calls (and for non-TTS tasks)
 EXECUTOR_WORKERS = int(os.getenv("VICREEL_EXECUTOR_WORKERS", "4"))
 
 # File cleanup settings
@@ -49,6 +52,9 @@ RATE_LIMIT_MAX = int(os.getenv("VICREEL_RATE_LIMIT_MAX", "30"))  # requests per 
 
 # Path to aliases file (prioritized). You can override with env var.
 ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "config/speaker_aliases.json")
+
+# Use subprocess-based synthesis for isolation (1 = enabled). Can set to "0" to disable.
+USE_SUBPROCESS = os.getenv("VICREEL_USE_SUBPROCESS", "1") == "1"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -90,7 +96,7 @@ def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
     return True
 
 # -------------------
-# Executor pool (shared) - used only for non-TTS tasks like conversion and cleanup
+# Executor pool (shared) - used for non-TTS tasks and fallback executor
 # -------------------
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 
@@ -130,17 +136,43 @@ async def check_rate_limit(api_key_value: str) -> Optional[JSONResponse]:
     return None
 
 # -------------------
-# TTS Manager with executor usage and extended synth signature
-# TTS synthesis is now synchronous to avoid thread-safety issues
+# Helper: child worker synth function (runs in separate process)
+# -------------------
+def _worker_synthesize_process(params: Dict[str, Any], result_queue: "Queue"):
+    """
+    Child process entrypoint. Runs TTS synthesis synchronously and reports result via result_queue.
+    params: dict containing 'model', 'kwargs' (kwargs for tts_to_file)
+    Puts {'ok': True} on success, or {'ok': False, 'error': "...", 'trace': "..."} on failure.
+    """
+    try:
+        # Import TTS lazily inside child process to isolate memory
+        from TTS.api import TTS as _TTS_child  # local alias
+        model_name = params.get("model")
+        kwargs = params.get("kwargs", {})
+        # Construct TTS instance (will load model or reuse cached in child)
+        tts = _TTS_child(model_name)
+        # call to tts_to_file (blocking)
+        tts.tts_to_file(**kwargs)
+        result_queue.put({"ok": True})
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            result_queue.put({"ok": False, "error": str(e), "trace": tb})
+        except Exception:
+            # If queue.put fails, there's nothing we can do
+            pass
+
+# -------------------
+# TTS Manager with process-isolated synthesis (fallback to executor)
 # -------------------
 class TTSManager:
     def __init__(self, default_model: str, executor: ThreadPoolExecutor):
         self.default_model = default_model
-        self._models: dict[str, TTS] = {}
+        self._models: dict[str, Any] = {}  # store TTS instances if we create in-process
         self._lock = asyncio.Lock()
         self._executor = executor
 
-    async def get(self, model_name: Optional[str] = None) -> TTS:
+    async def get(self, model_name: Optional[str] = None):
         name = model_name or self.default_model
         if name in self._models:
             return self._models[name]
@@ -149,11 +181,14 @@ class TTSManager:
                 return self._models[name]
             loop = asyncio.get_event_loop()
             logger.info(f"Loading model {name} (this may take some time)")
-            ctor = partial(TTS, name)
+            # Create model instance in-process (for introspection: speakers/languages)
+            def ctor():
+                from TTS.api import TTS
+                return TTS(name)
             tts_inst = await loop.run_in_executor(self._executor, ctor)
             self._models[name] = tts_inst
             logger.info(f"Model {name} loaded")
-            # After model is loaded, reconcile aliases (if needed)
+            # Try to reconcile aliases now that model speakers are available (if function present)
             try:
                 available = getattr(tts_inst, 'speakers', []) or getattr(tts_inst, 'voices', []) or []
                 if available:
@@ -176,11 +211,15 @@ class TTSManager:
         speaker: Optional[str] = None,
         options: Optional[Dict[str, Any]] = None
     ):
-        tts = await self.get(model_name)
-        # No loop needed for sync call
+        """
+        Isolated synthesis:
+         - Default: spawn a child process which imports TTS and runs tts_to_file.
+         - Fallback: if subprocess not possible, run tts.tts_to_file inside executor (thread).
+        """
+        # Build kwargs for child/fallback call
+        kwargs: Dict[str, Any] = {"text": text, "file_path": wav_path}
         effective_model = (model_name or self.default_model).lower()
 
-        kwargs: Dict[str, Any] = {"text": text, "file_path": wav_path}
         if "xtts" in effective_model:
             kwargs["language"] = language
             if speaker_wav:
@@ -188,7 +227,9 @@ class TTSManager:
             elif speaker:
                 kwargs["speaker"] = speaker
             else:
-                speakers = getattr(tts, 'speakers', []) or getattr(tts, 'voices', []) or []
+                # try to pick default speaker
+                tts_obj = await self.get(model_name)
+                speakers = getattr(tts_obj, 'speakers', []) or getattr(tts_obj, 'voices', [])
                 if speakers:
                     kwargs["speaker"] = speakers[0]
                     logger.info(f"Using default speaker: {kwargs['speaker']}")
@@ -198,34 +239,95 @@ class TTSManager:
             if speaker:
                 kwargs["speaker"] = speaker
 
+        # Merge options filtering supported kwargs if possible
         if options:
-            func = getattr(tts, 'tts_to_file', None)
-            if func:
-                try:
+            # Try to get signature from in-process model if available
+            func_sig_supported = None
+            try:
+                # attempt to find supported keys via model instance (if loaded)
+                tts_obj = self._models.get(model_name or self.default_model)
+                func = getattr(tts_obj, 'tts_to_file', None) if tts_obj else None
+                if func:
                     sig = inspect.signature(func)
-                    supported = set(sig.parameters.keys())
-                    filtered = {k: v for k, v in options.items() if k in supported}
-                    if filtered:
-                        kwargs.update(filtered)
-                except Exception:
-                    logger.exception("Failed to inspect tts_to_file signature; ignoring options")
+                    func_sig_supported = {k for k in sig.parameters.keys()}
+            except Exception:
+                func_sig_supported = None
+            if func_sig_supported:
+                filtered = {k: v for k, v in options.items() if k in func_sig_supported}
             else:
-                logger.warning("Model has no tts_to_file; ignoring options")
+                filtered = options
+            if filtered:
+                kwargs.update(filtered)
 
         log_event("info", {"event": "synth_prepare", "model": model_name or self.default_model, "kwargs_keys": list(kwargs.keys()), "text_len": len(text)})
         logger.info(f"Synth kwargs: {kwargs}")
 
-        func = getattr(tts, 'tts_to_file', None)
-        if func is None:
-            raise RuntimeError("Model object does not implement tts_to_file")
-        
-        # Synchronous call to avoid thread issues
-        func(**kwargs)
-
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
-            raise RuntimeError(f"Generated file {wav_path} is empty or too small")
-        log_event("info", {"event": "synth_done", "wav_path": wav_path, "size": os.path.getsize(wav_path)})
-
+        # If configured, run in child process for isolation
+        if USE_SUBPROCESS:
+            result_q = Queue()
+            params = {"model": model_name or self.default_model, "kwargs": kwargs}
+            proc = Process(target=_worker_synthesize_process, args=(params, result_q))
+            proc.start()
+            loop = asyncio.get_event_loop()
+            try:
+                # Wait for child result with timeout using run_in_executor to avoid blocking event loop
+                # We'll call result_q.get() inside a thread and wrap with asyncio.wait_for
+                get_in_thread = partial(result_q.get, True)
+                result = await asyncio.wait_for(loop.run_in_executor(None, get_in_thread), timeout=SYNTH_TIMEOUT_SECONDS)
+                # result is expected to be dict {"ok": True} or {"ok": False, "error": "..."}
+                if not isinstance(result, dict) or not result.get("ok", False):
+                    err = result.get("error", "<no error provided>") if isinstance(result, dict) else str(result)
+                    trace = result.get("trace", None) if isinstance(result, dict) else None
+                    raise RuntimeError(f"Child synthesis failed: {err}\n{trace or ''}")
+                # success: ensure file exists and size OK
+                if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
+                    raise RuntimeError(f"Generated file {wav_path} is empty or too small")
+                log_event("info", {"event": "synth_done", "wav_path": wav_path, "size": os.path.getsize(wav_path)})
+            except asyncio.TimeoutError:
+                # kill process
+                try:
+                    proc.terminate()
+                except Exception:
+                    logger.exception("Failed to terminate child process after timeout")
+                # attempt to join
+                try:
+                    proc.join(2)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Synthesis timed out after {SYNTH_TIMEOUT_SECONDS} seconds")
+            finally:
+                # consume/join/close
+                try:
+                    result_q.close()
+                except Exception:
+                    pass
+                try:
+                    proc.join(timeout=1)
+                except Exception:
+                    pass
+        else:
+            # Fallback: run in executor (thread)
+            try:
+                from TTS.api import TTS
+                tts = self._models.get(model_name or self.default_model)
+                if not tts:
+                    # create a tts instance in thread
+                    def ctor_tts():
+                        return TTS(model_name or self.default_model)
+                    loop = asyncio.get_event_loop()
+                    tts = await loop.run_in_executor(self._executor, ctor_tts)
+                    # store for future introspection
+                    self._models[model_name or self.default_model] = tts
+                func = getattr(tts, 'tts_to_file', None)
+                if func is None:
+                    raise RuntimeError("Model object does not implement tts_to_file")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(self._executor, partial(func, **kwargs))
+                if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
+                    raise RuntimeError(f"Generated file {wav_path} is empty or too small")
+                log_event("info", {"event": "synth_done", "wav_path": wav_path, "size": os.path.getsize(wav_path)})
+            except Exception as e:
+                raise
 
 tts_manager = TTSManager(DEFAULT_MODEL, _executor)
 _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -233,7 +335,6 @@ _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 # -------------------
 # Aliases loader/persistence (enhanced & tolerant)
 # -------------------
-
 def _is_valid_alias_map(obj) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -242,14 +343,13 @@ def _is_valid_alias_map(obj) -> bool:
             return False
     return True
 
-
 def _load_aliases_from_file(path: str) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if _is_valid_alias_map(data):
             logger.info(f"Loaded {len(data)} speaker aliases (raw) from file {path}")
-            logger.info(f"Loaded aliases: {data}")  # Added for debug
+            logger.info(f"Loaded aliases keys sample: {list(data.keys())[:10]}")
             return data
         else:
             logger.warning(f"Aliases file {path} has invalid format; expected mapping str->str. Ignoring.")
@@ -260,7 +360,6 @@ def _load_aliases_from_file(path: str) -> Dict[str, str]:
     except Exception as e:
         logger.exception(f"Failed to load aliases file {path}: {e}")
     return {}
-
 
 def _load_aliases_from_env() -> Dict[str, str]:
     raw = os.getenv("VICREEL_SPEAKER_ALIASES", "") or ""
@@ -279,7 +378,6 @@ def _load_aliases_from_env() -> Dict[str, str]:
     except Exception as e:
         logger.exception(f"Unexpected error parsing VICREEL_SPEAKER_ALIASES env var: {e}")
     return {}
-
 
 def _save_aliases_to_file(path: str, aliases: Dict[str, str]):
     try:
@@ -326,7 +424,6 @@ def _make_alias_key(display_name: str, existing_keys: Optional[set] = None) -> s
         key = f"{base}_{n}"
     return key
 
-
 def _normalize_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -335,7 +432,6 @@ def _normalize_text(s: str) -> str:
     s = ''.join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"[^a-z0-9]+", ' ', s)
     return s.strip()
-
 
 def _build_alias_indexes_from_real_map():
     ALIASKEY_TO_REAL.clear()
@@ -351,7 +447,6 @@ def _build_alias_indexes_from_real_map():
         ALIASKEY_TO_DISPLAY[key] = display
     logger.info(f"Built alias indexes: {len(ALIASKEY_TO_REAL)} aliases available")
 
-
 def reconcile_aliases_with_model_available(available: List[str]):
     """
     Try to reconcile RAW_SPEAKER_ALIASES (which may be keyed by human names) with the
@@ -360,15 +455,11 @@ def reconcile_aliases_with_model_available(available: List[str]):
     logger.info(f"Reconciling {len(RAW_SPEAKER_ALIASES)} raw aliases against {len(available)} model speakers")
     authoritative: Dict[str, str] = {}
     normalized_available = {a: _normalize_text(a) for a in available}
-    # also build reverse normalized -> real mapping for quick lookup
-    norm_to_real = {}
-    for real, norm in normalized_available.items():
-        norm_to_real.setdefault(norm, real)
 
     for raw_key, display in RAW_SPEAKER_ALIASES.items():
         key_norm = _normalize_text(raw_key)
         chosen = None
-        # 1) if raw_key exactly matches a real id (case-sensitive or case-insensitive)
+        # 1) if raw_key exactly matches a real id (case-sensitive)
         if raw_key in available:
             chosen = raw_key
         else:
@@ -388,7 +479,6 @@ def reconcile_aliases_with_model_available(available: List[str]):
             candidates = list(normalized_available.values())
             match = difflib.get_close_matches(key_norm, candidates, n=1, cutoff=0.75)
             if match:
-                # find real corresponding
                 for real, norm in normalized_available.items():
                     if norm == match[0]:
                         chosen = real
@@ -398,8 +488,7 @@ def reconcile_aliases_with_model_available(available: List[str]):
         else:
             logger.warning(f"Could not reconcile alias key '{raw_key}' -> '{display}' to any model speaker; skipping")
 
-    # Keep any existing real->display mappings if they were already present in RAW and use them
-    # Also ensure we don't lose explicit real-id entries in RAW if user supplied those
+    # Keep any explicit real-id entries in RAW if user supplied those
     for raw_key, display in RAW_SPEAKER_ALIASES.items():
         if raw_key in available and raw_key not in authoritative:
             authoritative[raw_key] = display
@@ -408,13 +497,11 @@ def reconcile_aliases_with_model_available(available: List[str]):
     SPEAKER_ALIASES_REAL.update(authoritative)
     _build_alias_indexes_from_real_map()
 
-
-# Load raw aliases (file has priority). We expect keys MAY BE human names OR real speaker ids.
+# Load raw aliases (file has priority)
 RAW_SPEAKER_ALIASES = _load_aliases_from_file(ALIASES_FILE_PATH)
 if not RAW_SPEAKER_ALIASES:
     RAW_SPEAKER_ALIASES = _load_aliases_from_env()
 
-# At startup we don't yet have model speakers, aliases will be reconciled on first model load.
 logger.info(f"Loaded raw speaker alias entries: {len(RAW_SPEAKER_ALIASES)} (will try to reconcile when model is available)")
 
 # -------------------
@@ -424,7 +511,6 @@ def _convert_wav_to_mp3(src: str, dst: str):
     audio = AudioSegment.from_wav(src)
     audio.export(dst, format="mp3")
 
-
 def _safe_remove(path: str):
     try:
         if os.path.exists(path):
@@ -432,7 +518,6 @@ def _safe_remove(path: str):
             logger.debug(f"Removed temporary file {path}")
     except Exception as e:
         logger.warning(f"Could not delete {path}: {e}")
-
 
 def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_AGE, max_files: int = PERSIST_OUTPUT_MAX_FILES):
     try:
@@ -472,7 +557,6 @@ def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_
 # -------------------
 # Speaker resolution (accept alias_key or display_name; hide real ids)
 # -------------------
-
 def _normalize(s: str) -> str:
     return s.strip().lower() if isinstance(s, str) else ""
 
@@ -590,13 +674,11 @@ async def update_aliases(body: Dict[str, str]):
         logger.warning("Could not persist aliases to file; changes remain in-memory only")
     # Attempt to reconcile now if model available
     try:
-        # get any loaded model to supply available list
         some_model = next(iter(tts_manager._models.values()), None)
         if some_model:
             available = getattr(some_model, 'speakers', []) or getattr(some_model, 'voices', []) or []
             reconcile_aliases_with_model_available(available)
         else:
-            # indexes will be rebuilt when model loads
             _build_alias_indexes_from_real_map()
     except Exception:
         logger.exception("Failed to rebuild alias indexes after update")
@@ -641,7 +723,8 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         speaker_wav = form.get("speaker_wav", None)
         options = {}
 
-    await tts_manager.get(model)  # Force model load and alias reconciliation before resolving speaker
+    # Force model load and reconciliation before resolving speaker
+    await tts_manager.get(model)
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -656,7 +739,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     resolved_speaker_real: Optional[str] = None
     if speaker_input:
         resolved_speaker_real = await resolve_speaker_input(speaker_input, model)
-        logger.info(f"Resolved speaker input '{speaker_input}' to '{resolved_speaker_real}'")  # Added for debug
+        logger.info(f"Resolved speaker input '{speaker_input}' to '{resolved_speaker_real}'")
         if not resolved_speaker_real:
             sample = []
             for ak, display in list(ALIASKEY_TO_DISPLAY.items())[:40]:
@@ -704,6 +787,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
             METRICS["error_total"] += 1
             log_event("error", {"event": "tts_error", "error": str(e)})
             logger.exception("TTS error (synthesis)")
+            # return 500 with non-sensitive message
             raise HTTPException(status_code=500, detail="Internal TTS error")
 
         loop = asyncio.get_event_loop()
