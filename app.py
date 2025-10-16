@@ -1,4 +1,4 @@
-# app.py — VicReel (version avec timeout, purge, metrics, rate-limit, executor pool)
+# app.py — VicReel (version finale avec timeout, purge, metrics, rate-limit, executor pool)
 import os
 import uuid
 import asyncio
@@ -7,9 +7,10 @@ import json
 import inspect
 import time
 import re
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from TTS.api import TTS
 from pydub import AudioSegment
-from functools import partial
 
 # -------------------
 # Configuration (env-overridable)
@@ -293,13 +293,13 @@ def _save_aliases_to_file(path: str, aliases: Dict[str, str]):
 _slugify_re = re.compile(r"[^a-z0-9_]+")
 def _make_alias_key(display_name: str, existing_keys: Optional[set] = None) -> str:
     base = display_name.strip().lower()
-    # replace non-alnum with underscore
+    # replace whitespace with underscore and non-alnum with underscore
     base = re.sub(r"\s+", "_", base)
     base = _slugify_re.sub("_", base)
     base = base.strip("_")
     if not base:
         base = "alias"
-    # ensure unique
+    # ensure unique (existing_keys expected to contain lowercase keys)
     if not existing_keys:
         return base
     key = base
@@ -312,20 +312,20 @@ def _make_alias_key(display_name: str, existing_keys: Optional[set] = None) -> s
 # The authoritative mapping loaded from file/env: real_speaker_id -> display_name (alias)
 SPEAKER_ALIASES: Dict[str, str] = {}
 # Derived indexes for quick lookups (built at startup and on updates)
-# alias_key -> real_id
+# alias_key (lowercase) -> real_id
 ALIASKEY_TO_REAL: Dict[str, str] = {}
-# real_id -> alias_key
+# real_id -> alias_key (lowercase)
 REAL_TO_ALIASKEY: Dict[str, str] = {}
-# alias_key -> display_name
+# alias_key (lowercase) -> display_name
 ALIASKEY_TO_DISPLAY: Dict[str, str] = {}
 
 def _build_alias_indexes():
     """
     From SPEAKER_ALIASES (real_id -> display_name) build:
-      - ALIASKEY_TO_REAL
-      - REAL_TO_ALIASKEY
+      - ALIASKEY_TO_REAL  (keys lowercase)
+      - REAL_TO_ALIASKEY  (values lowercase)
       - ALIASKEY_TO_DISPLAY
-    so we expose ONLY alias_key to clients.
+    Ensures alias keys are unique and stable.
     """
     ALIASKEY_TO_REAL.clear()
     REAL_TO_ALIASKEY.clear()
@@ -335,10 +335,11 @@ def _build_alias_indexes():
     for real in sorted(SPEAKER_ALIASES.keys()):
         display = SPEAKER_ALIASES[real]
         key = _make_alias_key(display, existing)
-        existing.add(key)
-        ALIASKEY_TO_REAL[key] = real
-        REAL_TO_ALIASKEY[real] = key
-        ALIASKEY_TO_DISPLAY[key] = display
+        key_l = key.lower()
+        existing.add(key_l)
+        ALIASKEY_TO_REAL[key_l] = real
+        REAL_TO_ALIASKEY[real] = key_l
+        ALIASKEY_TO_DISPLAY[key_l] = display
     logger.info(f"Built alias indexes: {len(ALIASKEY_TO_REAL)} aliases available")
 
 # Load initial aliases (file preferred)
@@ -411,7 +412,7 @@ def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_
         logger.exception("cleanup_old_files failed")
 
 # -------------------
-# Speaker resolution (accept only alias_key or display_name; hide real ids)
+# Speaker resolution (accept alias_key or display_name; hide real ids)
 # -------------------
 def _normalize(s: str) -> str:
     return s.strip().lower() if isinstance(s, str) else ""
@@ -419,32 +420,37 @@ def _normalize(s: str) -> str:
 async def resolve_speaker_input(speaker_input: Optional[str], model_name: Optional[str] = None) -> Optional[str]:
     """
     Resolve a client-provided speaker_input to the real speaker id expected by Coqui TTS.
-    The client should ideally send the alias_key (the ID shown by /voices), but we also accept
-    the display_name (alias text) or fuzzy variants (case-insensitive).
-    Return real_speaker_id (string) if resolved, or None if no speaker requested.
-    Raises HTTPException(400) with available alias sample if the input cannot be resolved.
+    Accepts:
+      - alias_key (id returned by /voices) -> exact (case-insensitive)
+      - display_name (alias text) -> exact or fuzzy (case-insensitive)
+      - or a real speaker id (exact or fuzzy) from the model
+    Returns real speaker id or None if not resolved.
     """
     if not speaker_input:
         return None
 
-    low = _normalize(speaker_input)
+    inp = speaker_input.strip()
+    # Remove trailing parenthetical (e.g. "Ari (male)" -> "Ari") for display matching, but preserve original for alias-key matching
+    inp_stripped = re.sub(r"\s*\(.*\)\s*$", "", inp).strip()
+    low_stripped = _normalize(inp_stripped)
+    low_raw = _normalize(inp)
 
-    # 1) If input matches alias key exactly -> map to real id
-    if low in ALIASKEY_TO_REAL:
-        return ALIASKEY_TO_REAL[low]
+    # 1) direct alias key match (alias keys are lowercase)
+    if low_raw in ALIASKEY_TO_REAL:
+        return ALIASKEY_TO_REAL[low_raw]
 
-    # 2) If input exactly matches a display name (case-insensitive)
+    # 2) exact match on display name
     for ak, display in ALIASKEY_TO_DISPLAY.items():
-        if _normalize(display) == low:
-            return ALIASKEY_TO_REAL[ak]
+        if _normalize(display) == low_stripped or _normalize(display) == low_raw:
+            return ALIASKEY_TO_REAL.get(ak)
 
-    # 3) Try fuzzy match against alias display names (prefix/contains)
+    # 3) fuzzy match on display name (prefix/contains)
     for ak, display in ALIASKEY_TO_DISPLAY.items():
         dnorm = _normalize(display)
-        if dnorm.startswith(low) or low in dnorm:
-            return ALIASKEY_TO_REAL[ak]
+        if dnorm.startswith(low_stripped) or low_stripped in dnorm or low_raw in dnorm:
+            return ALIASKEY_TO_REAL.get(ak)
 
-    # 4) If model present, try to match against model's real speaker ids (case-insensitive)
+    # 4) if model loaded, try matching real speaker ids (exact or fuzzy)
     available = []
     try:
         tts_obj = await tts_manager.get(model_name) if model_name else None
@@ -455,13 +461,15 @@ async def resolve_speaker_input(speaker_input: Optional[str], model_name: Option
     if available:
         # exact real id match
         for r in available:
-            if r == speaker_input:
+            if r == inp or _normalize(r) == low_raw:
                 return r
+        # fuzzy
         for r in available:
-            if _normalize(r) == low or low in _normalize(r) or _normalize(r).startswith(low):
+            rl = _normalize(r)
+            if rl.startswith(low_raw) or low_raw in rl or rl.startswith(low_stripped) or low_stripped in rl:
                 return r
 
-    # 5) Not resolved -> return None (caller will error with available sample)
+    # unresolved
     return None
 
 # -------------------
@@ -491,10 +499,11 @@ async def download_model(body: dict):
 @app.get("/voices", dependencies=[Depends(verify_api_key)])
 async def list_voices(model: Optional[str] = None):
     """
-    Return available voices for the model — BUT OBFUSCATE real ids:
-      - id: alias_key (stable machine id exposed to clients)
-      - display_name: user-friendly alias (what user sees)
-    Clients must send alias_key to /tts to select a voice.
+    Return available voices for the model — OBFUSCATE real ids:
+      - id: alias_key (lowercase)
+      - display_name: user-friendly alias
+    If a real speaker exists but is not in SPEAKER_ALIASES, create a temporary alias and register it in-memory
+    so the client can use that id immediately.
     """
     # ensure model loaded to reflect real availability
     try:
@@ -503,23 +512,29 @@ async def list_voices(model: Optional[str] = None):
     except Exception:
         available = []
 
-    # Present only aliases (intersection of available real ids and our alias map)
     result = []
-    # If some real speakers are present but not aliased, we still provide a default display name
-    for ak, real in ALIASKEY_TO_REAL.items():
+    existing_keys = set(ALIASKEY_TO_REAL.keys())
+
+    # First, include aliases we have (and that are available or we don't know availability)
+    for ak_l, real in ALIASKEY_TO_REAL.items():
         if not available or real in available:
-            result.append({"id": ak, "display_name": ALIASKEY_TO_DISPLAY.get(ak, real)})
-    # Also include any available real speakers not in alias file (but hide real id: create ad-hoc alias)
+            display = ALIASKEY_TO_DISPLAY.get(ak_l, real)
+            result.append({"id": ak_l, "display_name": display})
+
+    # Add any available real speakers that don't yet have an alias (create temporary alias keys and register in-memory)
     if available:
-        # find reals without alias
-        missing = [r for r in available if r not in REAL_TO_ALIASKEY]
-        existing_keys = set(ALIASKEY_TO_REAL.keys())
-        for r in missing:
-            # create temporary alias key from real id (not persisted)
-            display = r
+        missing_reals = [r for r in available if r not in REAL_TO_ALIASKEY]
+        for real in missing_reals:
+            display = real
             tmp_key = _make_alias_key(display, existing_keys)
-            existing_keys.add(tmp_key)
-            result.append({"id": tmp_key, "display_name": display})
+            tmp_key_l = tmp_key.lower()
+            existing_keys.add(tmp_key_l)
+            # register temporary mapping in-memory so it can be used immediately
+            ALIASKEY_TO_REAL[tmp_key_l] = real
+            ALIASKEY_TO_DISPLAY[tmp_key_l] = display
+            REAL_TO_ALIASKEY[real] = tmp_key_l
+            result.append({"id": tmp_key_l, "display_name": display})
+
     return {"model": model or DEFAULT_MODEL, "voices": result, "count": len(result)}
 
 @app.get("/languages", dependencies=[Depends(verify_api_key)])
