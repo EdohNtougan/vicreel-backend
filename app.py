@@ -641,6 +641,8 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         speaker_wav = form.get("speaker_wav", None)
         options = {}
 
+    await tts_manager.get(model)  # Force model load and alias reconciliation before resolving speaker
+
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
