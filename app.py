@@ -548,7 +548,7 @@ async def list_languages(model: Optional[str] = None):
     except Exception:
         langs = None
     if not langs:
-        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja"]
+        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja", "ar"]
     return {"model": model or DEFAULT_MODEL, "languages": langs}
 
 @app.post("/voices/aliases", dependencies=[Depends(verify_api_key)])
