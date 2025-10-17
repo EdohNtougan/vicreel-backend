@@ -52,6 +52,7 @@ RATE_LIMIT_MAX = int(os.getenv("VICREEL_RATE_LIMIT_MAX", "30"))  # requests per 
 
 # Path to aliases file (prioritized). You can override with env var.
 ALIASES_FILE_PATH = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "config/speaker_aliases.json")
+RESOLVED_ALIASES_FILE_PATH = os.getenv("VICREEL_RESOLVED_ALIASES_FILE", "config/resolved_aliases.json")
 
 # Use subprocess-based synthesis for isolation (1 = enabled). Can set to "0" to disable.
 USE_SUBPROCESS = os.getenv("VICREEL_USE_SUBPROCESS", "1") == "1"
@@ -335,6 +336,7 @@ _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 # -------------------
 # Aliases loader/persistence (enhanced & tolerant)
 # -------------------
+
 def _is_valid_alias_map(obj) -> bool:
     if not isinstance(obj, dict):
         return False
@@ -343,13 +345,14 @@ def _is_valid_alias_map(obj) -> bool:
             return False
     return True
 
+
 def _load_aliases_from_file(path: str) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if _is_valid_alias_map(data):
             logger.info(f"Loaded {len(data)} speaker aliases (raw) from file {path}")
-            logger.info(f"Loaded aliases keys sample: {list(data.keys())[:10]}")
+            logger.info(f"Loaded aliases: {data}")  # Added for debug
             return data
         else:
             logger.warning(f"Aliases file {path} has invalid format; expected mapping str->str. Ignoring.")
@@ -360,6 +363,7 @@ def _load_aliases_from_file(path: str) -> Dict[str, str]:
     except Exception as e:
         logger.exception(f"Failed to load aliases file {path}: {e}")
     return {}
+
 
 def _load_aliases_from_env() -> Dict[str, str]:
     raw = os.getenv("VICREEL_SPEAKER_ALIASES", "") or ""
@@ -378,6 +382,7 @@ def _load_aliases_from_env() -> Dict[str, str]:
     except Exception as e:
         logger.exception(f"Unexpected error parsing VICREEL_SPEAKER_ALIASES env var: {e}")
     return {}
+
 
 def _save_aliases_to_file(path: str, aliases: Dict[str, str]):
     try:
@@ -424,6 +429,7 @@ def _make_alias_key(display_name: str, existing_keys: Optional[set] = None) -> s
         key = f"{base}_{n}"
     return key
 
+
 def _normalize_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
@@ -432,6 +438,7 @@ def _normalize_text(s: str) -> str:
     s = ''.join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"[^a-z0-9]+", ' ', s)
     return s.strip()
+
 
 def _build_alias_indexes_from_real_map():
     ALIASKEY_TO_REAL.clear()
@@ -447,6 +454,7 @@ def _build_alias_indexes_from_real_map():
         ALIASKEY_TO_DISPLAY[key] = display
     logger.info(f"Built alias indexes: {len(ALIASKEY_TO_REAL)} aliases available")
 
+
 def reconcile_aliases_with_model_available(available: List[str]):
     """
     Try to reconcile RAW_SPEAKER_ALIASES (which may be keyed by human names) with the
@@ -455,11 +463,15 @@ def reconcile_aliases_with_model_available(available: List[str]):
     logger.info(f"Reconciling {len(RAW_SPEAKER_ALIASES)} raw aliases against {len(available)} model speakers")
     authoritative: Dict[str, str] = {}
     normalized_available = {a: _normalize_text(a) for a in available}
+    # also build reverse normalized -> real mapping for quick lookup
+    norm_to_real = {}
+    for real, norm in normalized_available.items():
+        norm_to_real.setdefault(norm, real)
 
     for raw_key, display in RAW_SPEAKER_ALIASES.items():
         key_norm = _normalize_text(raw_key)
         chosen = None
-        # 1) if raw_key exactly matches a real id (case-sensitive)
+        # 1) if raw_key exactly matches a real id (case-sensitive or case-insensitive)
         if raw_key in available:
             chosen = raw_key
         else:
@@ -479,6 +491,7 @@ def reconcile_aliases_with_model_available(available: List[str]):
             candidates = list(normalized_available.values())
             match = difflib.get_close_matches(key_norm, candidates, n=1, cutoff=0.75)
             if match:
+                # find real corresponding
                 for real, norm in normalized_available.items():
                     if norm == match[0]:
                         chosen = real
@@ -488,7 +501,8 @@ def reconcile_aliases_with_model_available(available: List[str]):
         else:
             logger.warning(f"Could not reconcile alias key '{raw_key}' -> '{display}' to any model speaker; skipping")
 
-    # Keep any explicit real-id entries in RAW if user supplied those
+    # Keep any existing real->display mappings if they were already present in RAW and use them
+    # Also ensure we don't lose explicit real-id entries in RAW if user supplied those
     for raw_key, display in RAW_SPEAKER_ALIASES.items():
         if raw_key in available and raw_key not in authoritative:
             authoritative[raw_key] = display
@@ -497,11 +511,16 @@ def reconcile_aliases_with_model_available(available: List[str]):
     SPEAKER_ALIASES_REAL.update(authoritative)
     _build_alias_indexes_from_real_map()
 
-# Load raw aliases (file has priority)
+    # Persist the resolved map
+    _save_aliases_to_file(RESOLVED_ALIASES_FILE_PATH, SPEAKER_ALIASES_REAL)
+
+
+# Load raw aliases (file has priority). We expect keys MAY BE human names OR real speaker ids.
 RAW_SPEAKER_ALIASES = _load_aliases_from_file(ALIASES_FILE_PATH)
 if not RAW_SPEAKER_ALIASES:
     RAW_SPEAKER_ALIASES = _load_aliases_from_env()
 
+# At startup we don't yet have model speakers, aliases will be reconciled on first model load.
 logger.info(f"Loaded raw speaker alias entries: {len(RAW_SPEAKER_ALIASES)} (will try to reconcile when model is available)")
 
 # -------------------
@@ -511,6 +530,7 @@ def _convert_wav_to_mp3(src: str, dst: str):
     audio = AudioSegment.from_wav(src)
     audio.export(dst, format="mp3")
 
+
 def _safe_remove(path: str):
     try:
         if os.path.exists(path):
@@ -518,6 +538,7 @@ def _safe_remove(path: str):
             logger.debug(f"Removed temporary file {path}")
     except Exception as e:
         logger.warning(f"Could not delete {path}: {e}")
+
 
 def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_AGE, max_files: int = PERSIST_OUTPUT_MAX_FILES):
     try:
@@ -557,6 +578,7 @@ def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_
 # -------------------
 # Speaker resolution (accept alias_key or display_name; hide real ids)
 # -------------------
+
 def _normalize(s: str) -> str:
     return s.strip().lower() if isinstance(s, str) else ""
 
@@ -656,7 +678,7 @@ async def list_languages(model: Optional[str] = None):
     except Exception:
         langs = None
     if not langs:
-        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja"]
+        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja", "ar", "hi"]
     return {"model": model or DEFAULT_MODEL, "languages": langs}
 
 @app.post("/voices/aliases", dependencies=[Depends(verify_api_key)])
@@ -674,11 +696,13 @@ async def update_aliases(body: Dict[str, str]):
         logger.warning("Could not persist aliases to file; changes remain in-memory only")
     # Attempt to reconcile now if model available
     try:
+        # get any loaded model to supply available list
         some_model = next(iter(tts_manager._models.values()), None)
         if some_model:
             available = getattr(some_model, 'speakers', []) or getattr(some_model, 'voices', []) or []
             reconcile_aliases_with_model_available(available)
         else:
+            # indexes will be rebuilt when model loads
             _build_alias_indexes_from_real_map()
     except Exception:
         logger.exception("Failed to rebuild alias indexes after update")
@@ -717,14 +741,13 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
         form = await request.form()
         text = form.get("text")
         fmt = (form.get("format") or "wav").lower()
-        model = form.get("model", None)
-        language = form.get("language", DEFAULT_LANGUAGE)
-        speaker_input = form.get("speaker", None)
-        speaker_wav = form.get("speaker_wav", None)
+        model = body.get("model", None)
+        language = body.get("language", DEFAULT_LANGUAGE)
+        speaker_input = body.get("speaker", None)
+        speaker_wav = body.get("speaker_wav", None)
         options = {}
 
-    # Force model load and reconciliation before resolving speaker
-    await tts_manager.get(model)
+    await tts_manager.get(model)  # Force model load and alias reconciliation before resolving speaker
 
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -739,7 +762,7 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
     resolved_speaker_real: Optional[str] = None
     if speaker_input:
         resolved_speaker_real = await resolve_speaker_input(speaker_input, model)
-        logger.info(f"Resolved speaker input '{speaker_input}' to '{resolved_speaker_real}'")
+        logger.info(f"Resolved speaker input '{speaker_input}' to '{resolved_speaker_real}'")  # Added for debug
         if not resolved_speaker_real:
             sample = []
             for ak, display in list(ALIASKEY_TO_DISPLAY.items())[:40]:
@@ -787,7 +810,6 @@ async def tts_endpoint(request: Request, background_tasks: BackgroundTasks):
             METRICS["error_total"] += 1
             log_event("error", {"event": "tts_error", "error": str(e)})
             logger.exception("TTS error (synthesis)")
-            # return 500 with non-sensitive message
             raise HTTPException(status_code=500, detail="Internal TTS error")
 
         loop = asyncio.get_event_loop()
