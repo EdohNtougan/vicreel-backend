@@ -4,4 +4,5 @@ coqui-tts==0.27.2
 pydub
 soundfile
 python-multipart
-EOF
+torch
+torchaudio
