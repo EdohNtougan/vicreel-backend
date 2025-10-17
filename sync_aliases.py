@@ -1,4 +1,3 @@
-tee sync_aliases.py <<'EOF'
 #!/usr/bin/env python3
 # sync_aliases.py - Génère config/resolved_aliases.json à partir de RAW et model speakers
 from TTS.api import TTS
@@ -62,4 +61,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
