@@ -1,10 +1,7 @@
-tee requirements.txt <<'EOF'
 fastapi
 uvicorn[standard]
 coqui-tts==0.27.2
 pydub
 soundfile
 python-multipart
-torch
-torchaudio
 EOF
