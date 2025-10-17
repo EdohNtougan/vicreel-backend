@@ -1,4 +1,3 @@
-tee worker_synthesize.py <<'EOF'
 #!/usr/bin/env python3
 # worker_synthesize.py - File-queue worker pour VicReel TTS
 import os
@@ -70,7 +69,7 @@ def fuzzy_match_key_to_available(raw_key: str, available: List[str]) -> Optional
         if a.lower() == low:
             return a
     norm_raw = _normalize_text(raw_key)
-    # ---- CORRECTION ICI : création correcte du mapping normalisé -> réel ----
+    # CORRECTION : mapping normalisé -> réel
     norm_map = {_normalize_text(a): a for a in available}
     if norm_raw in norm_map:
         return norm_map[norm_raw]
@@ -224,4 +223,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
