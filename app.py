@@ -230,7 +230,7 @@ class TTSManager:
             else:
                 # try to pick default speaker
                 tts_obj = await self.get(model_name)
-                speakers = getattr(tts_obj, 'speakers', []) or getattr(tts_obj, 'voices', [])
+                speakers = getattr(tts_obj, 'speakers', []) or getattr(tts_obj, 'voices', []) or []
                 if speakers:
                     kwargs["speaker"] = speakers[0]
                     logger.info(f"Using default speaker: {kwargs['speaker']}")
@@ -240,17 +240,14 @@ class TTSManager:
             if speaker:
                 kwargs["speaker"] = speaker
 
-        # Merge options filtering supported kwargs if possible
         if options:
-            # Try to get signature from in-process model if available
             func_sig_supported = None
             try:
-                # attempt to find supported keys via model instance (if loaded)
                 tts_obj = self._models.get(model_name or self.default_model)
                 func = getattr(tts_obj, 'tts_to_file', None) if tts_obj else None
                 if func:
                     sig = inspect.signature(func)
-                    func_sig_supported = {k for k in sig.parameters.keys()}
+                    func_sig_supported = set(sig.parameters.keys())
             except Exception:
                 func_sig_supported = None
             if func_sig_supported:
@@ -263,7 +260,6 @@ class TTSManager:
         log_event("info", {"event": "synth_prepare", "model": model_name or self.default_model, "kwargs_keys": list(kwargs.keys()), "text_len": len(text)})
         logger.info(f"Synth kwargs: {kwargs}")
 
-        # If configured, run in child process for isolation
         if USE_SUBPROCESS:
             result_q = Queue()
             params = {"model": model_name or self.default_model, "kwargs": kwargs}
@@ -271,33 +267,26 @@ class TTSManager:
             proc.start()
             loop = asyncio.get_event_loop()
             try:
-                # Wait for child result with timeout using run_in_executor to avoid blocking event loop
-                # We'll call result_q.get() inside a thread and wrap with asyncio.wait_for
                 get_in_thread = partial(result_q.get, True)
                 result = await asyncio.wait_for(loop.run_in_executor(None, get_in_thread), timeout=SYNTH_TIMEOUT_SECONDS)
-                # result is expected to be dict {"ok": True} or {"ok": False, "error": "..."}
                 if not isinstance(result, dict) or not result.get("ok", False):
                     err = result.get("error", "<no error provided>") if isinstance(result, dict) else str(result)
                     trace = result.get("trace", None) if isinstance(result, dict) else None
                     raise RuntimeError(f"Child synthesis failed: {err}\n{trace or ''}")
-                # success: ensure file exists and size OK
                 if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
                     raise RuntimeError(f"Generated file {wav_path} is empty or too small")
                 log_event("info", {"event": "synth_done", "wav_path": wav_path, "size": os.path.getsize(wav_path)})
             except asyncio.TimeoutError:
-                # kill process
                 try:
                     proc.terminate()
                 except Exception:
                     logger.exception("Failed to terminate child process after timeout")
-                # attempt to join
                 try:
                     proc.join(2)
                 except Exception:
                     pass
                 raise RuntimeError(f"Synthesis timed out after {SYNTH_TIMEOUT_SECONDS} seconds")
             finally:
-                # consume/join/close
                 try:
                     result_q.close()
                 except Exception:
@@ -307,17 +296,14 @@ class TTSManager:
                 except Exception:
                     pass
         else:
-            # Fallback: run in executor (thread)
             try:
                 from TTS.api import TTS
                 tts = self._models.get(model_name or self.default_model)
                 if not tts:
-                    # create a tts instance in thread
                     def ctor_tts():
                         return TTS(model_name or self.default_model)
                     loop = asyncio.get_event_loop()
                     tts = await loop.run_in_executor(self._executor, ctor_tts)
-                    # store for future introspection
                     self._models[model_name or self.default_model] = tts
                 func = getattr(tts, 'tts_to_file', None)
                 if func is None:
@@ -418,6 +404,7 @@ def _make_alias_key(display_name: str, existing_keys: Optional[set] = None) -> s
     base = re.sub(r"\s+", "_", base)
     base = _slugify_re.sub("_", base)
     base = base.strip("_")
+    base = re.sub(r"_+", "_", base)  # Clean multiple _
     if not base:
         base = "alias"
     if not existing_keys:
@@ -520,8 +507,12 @@ RAW_SPEAKER_ALIASES = _load_aliases_from_file(ALIASES_FILE_PATH)
 if not RAW_SPEAKER_ALIASES:
     RAW_SPEAKER_ALIASES = _load_aliases_from_env()
 
-# At startup we don't yet have model speakers, aliases will be reconciled on first model load.
-logger.info(f"Loaded raw speaker alias entries: {len(RAW_SPEAKER_ALIASES)} (will try to reconcile when model is available)")
+# Load resolved aliases if exists
+SPEAKER_ALIASES_REAL = _load_aliases_from_file(RESOLVED_ALIASES_FILE_PATH)
+if SPEAKER_ALIASES_REAL:
+    _build_alias_indexes_from_real_map()
+else:
+    logger.info("No resolved aliases loaded; will reconcile on first model load")
 
 # -------------------
 # Helpers: convert & safe remove & purge old files
@@ -574,6 +565,7 @@ def cleanup_old_files(directory: str, max_age_seconds: int = PERSIST_OUTPUT_MAX_
             log_event("info", {"event": "cleanup_old_files", "removed": removed})
     except Exception:
         logger.exception("cleanup_old_files failed")
+
 
 # -------------------
 # Speaker resolution (accept alias_key or display_name; hide real ids)
@@ -678,7 +670,7 @@ async def list_languages(model: Optional[str] = None):
     except Exception:
         langs = None
     if not langs:
-        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja", "ar", "hi"]
+        langs = ["fr", "en", "es", "de", "it", "pt", "nl", "ru", "zh", "ja"]
     return {"model": model or DEFAULT_MODEL, "languages": langs}
 
 @app.post("/voices/aliases", dependencies=[Depends(verify_api_key)])
