@@ -1,4 +1,3 @@
-
 tee worker_synthesize.py <<'EOF'
 #!/usr/bin/env python3
 # worker_synthesize.py - File-queue worker pour VicReel TTS
