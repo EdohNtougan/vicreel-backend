@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# worker_synthesize.py - File-queue worker pour VicReel TTS
+# worker_synthesize.py - Version avec logique d'alias simplifiée
 import os
 import time
 import json
@@ -7,237 +7,153 @@ import uuid
 import logging
 import traceback
 from pathlib import Path
-from typing import Optional, Dict, Any, List
-import unicodedata
-import difflib
+from typing import Optional, Dict, Any
 from TTS.api import TTS
 from pydub import AudioSegment
-from threading import Lock  # Nouveau : lock pour race
+from threading import Lock
+from pydantic import BaseModel, Field
 
-# Config
-OUTPUT_DIR = os.getenv("VICREEL_OUTPUT_DIR", "outputs")
-JOBS_DIR = os.getenv("VICREEL_JOBS_DIR", "jobs")
-RAW_ALIASES_FILE = os.getenv("VICREEL_SPEAKER_ALIASES_FILE", "config/speaker_aliases.json")
-RESOLVED_ALIASES_FILE = os.getenv("VICREEL_RESOLVED_ALIASES", "config/resolved_aliases.json")
+# --- Configuration ---
+OUTPUT_DIR = Path(os.getenv("VICREEL_OUTPUT_DIR", "outputs"))
+JOBS_DIR = Path(os.getenv("VICREEL_JOBS_DIR", "jobs"))
+CONFIG_DIR = Path("config")
+# MODIFIÉ: On utilise notre nouvelle carte directe
+SPEAKER_MAP_FILE = CONFIG_DIR / "speaker_map.json" 
 DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
 POLL_INTERVAL = float(os.getenv("VICREEL_JOBS_POLL_SEC", "1.0"))
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(JOBS_DIR, exist_ok=True)
-os.makedirs(Path(RAW_ALIASES_FILE).parent, exist_ok=True)
-os.makedirs(Path(RESOLVED_ALIASES_FILE).parent, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ... (le reste de l'initialisation et les fonctions utilitaires restent les mêmes) ...
+OUTPUT_DIR.mkdir(exist_ok=True); JOBS_DIR.mkdir(exist_ok=True); CONFIG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger("vicreel-worker")
-
-# Nouveau : Lock pour concurrent safe
 job_lock = Lock()
 
-def load_json(path: str) -> Dict[str, Any]:
+class TTSJob(BaseModel):
+    id: str = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:12]}")
+    text: str; model: str = DEFAULT_MODEL; language: str = "fr"
+    speaker: Optional[str] = None # L'utilisateur fournit l'alias propre ici (ex: "bernice_female")
+    speaker_wav: Optional[str] = None; speaker_real: Optional[str] = None
+    format: str = "wav"; options: Optional[Dict[str, Any]] = None
+
+def atomic_write_json(path: Path, data: Dict[str, Any]):
+    tmp_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        logger.exception("Failed to load JSON %s", path)
-        return {}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception: logger.exception("Failed atomic write to %s", path)
 
-def atomic_write_json(path: str, obj: Dict[str, Any]):
-    tmp = f"{path}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-        logger.info("Wrote status to %s", path)  # Nouveau log
-    except Exception as e:
-        logger.exception("Failed atomic write to %s: %s", path, e)
-
-def _normalize_text(s: str) -> str:
-    if not isinstance(s, str):
-        return ""
-    s = s.strip().lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace("-", " ").replace("_", " ").replace("'", " ").replace('"', " ")
-    import re
-    s = re.sub(r"[^a-z0-9\s]+", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def fuzzy_match_key_to_available(raw_key: str, available: List[str]) -> Optional[str]:
-    if not raw_key:
-        return None
-    if raw_key in available:
-        return raw_key
-    low = raw_key.strip().lower()
-    for a in available:
-        if a.lower() == low:
-            return a
-    norm_raw = _normalize_text(raw_key)
-    norm_map = {_normalize_text(a): a for a in available}
-    if norm_raw in norm_map:
-        return norm_map[norm_raw]
-    for a in available:
-        an = _normalize_text(a)
-        if norm_raw and (norm_raw in an or an in norm_raw):
-            return a
-    candidates = list(norm_map.keys())
-    if candidates:
-        match = difflib.get_close_matches(norm_raw, candidates, n=1, cutoff=0.75)
-        if match:
-            return norm_map[match[0]]
-    return None
-
-def synth_sync(tts_obj, text: str, wav_path: str, model_name: Optional[str], language: str,
-               speaker_wav: Optional[str], speaker_real: Optional[str], options: Optional[Dict[str, Any]] = None):
-    kwargs = {"text": text, "file_path": wav_path}
-    effective_model = (model_name or DEFAULT_MODEL).lower()
-    if "xtts" in effective_model:
-        kwargs["language"] = language
-        if speaker_wav:
-            kwargs["speaker_wav"] = speaker_wav
-        elif speaker_real:
-            kwargs["speaker"] = speaker_real
+# ... (gardez la fonction synth_audio telle quelle, elle est parfaite) ...
+def synth_audio(tts_obj: TTS, job: TTSJob, wav_path: Path):
+    kwargs = { "text": job.text, "file_path": str(wav_path), "language": job.language }
+    if "xtts" in job.model:
+        if job.speaker_wav: kwargs["speaker_wav"] = job.speaker_wav
+        elif job.speaker_real: kwargs["speaker"] = job.speaker_real
         else:
-            speakers = getattr(tts_obj, "speakers", []) or getattr(tts_obj, "voices", []) or []
-            if speakers:
-                kwargs["speaker"] = speakers[0]
+            available_speakers = getattr(tts_obj, "speakers", [])
+            if available_speakers:
+                kwargs["speaker"] = available_speakers[0]
+                logger.warning("No speaker resolved, falling back to first available: '%s'", kwargs["speaker"])
     else:
-        if speaker_real:
-            kwargs["speaker"] = speaker_real
+        if job.speaker_real: kwargs["speaker"] = job.speaker_real
+    logger.info("Calling TTS.tts_to_file with: %s", kwargs)
+    tts_obj.tts_to_file(**kwargs)
+    logger.info("TTS synthesis completed successfully.")
 
-    if options:
-        try:
-            import inspect
-            func = getattr(tts_obj, "tts_to_file", None)
-            if func:
-                sig = inspect.signature(func)
-                allowed = set(sig.parameters.keys())
-                kwargs.update({k: v for k, v in options.items() if k in allowed})
-        except Exception:
-            logger.exception("options filtering failed")
 
-    func = getattr(tts_obj, "tts_to_file", None)
-    if func is None:
-        raise RuntimeError("Model object missing tts_to_file")
-    func(**kwargs)
+def process_job_file(job_path: Path, tts_obj: TTS, speaker_map: Dict[str, str]):
+    job_id_from_filename = job_path.stem.replace(".inprogress", "")
+    status_path = JOBS_DIR / f"{job_id_from_filename}.status.json"
+    
+    try:
+        job = TTSJob(**json.loads(job_path.read_text(encoding="utf-8")))
+        job.id = job_id_from_filename
+    except Exception as e:
+        logger.error("Job file %s is invalid: %s", job_path, e)
+        atomic_write_json(status_path, {"job_id": job_id_from_filename, "state": "error", "message": f"Invalid job JSON: {e}"})
+        return
 
-def process_job_file(path: str, tts_obj):
-    with job_lock:  # Nouveau : lock pour safe concurrent
-        logger.info("Processing job: %s", path)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                job = json.load(f)
-        except Exception as e:
-            logger.exception("Failed to read job file %s: %s", path, e)
-            return  # Nouveau : no delete on parse error
+    logger.info("Processing job ID: %s", job.id)
+    atomic_write_json(status_path, {"job_id": job.id, "state": "started", "ts": time.time()})
 
-        job_id = job.get("id") or str(uuid.uuid4())
-        job["id"] = job_id
-        status_path = os.path.join(JOBS_DIR, f"{job_id}.status.json")
-        wav_out = os.path.join(OUTPUT_DIR, f"{job_id}.wav")
-        mp3_out = os.path.join(OUTPUT_DIR, f"{job_id}.mp3")
+    wav_out = OUTPUT_DIR / f"{job.id}.wav"
+    final_out_path = OUTPUT_DIR / f"{job.id}.{job.format}"
 
-        atomic_write_json(status_path, {"job_id": job_id, "state": "started", "ts": time.time()})
-        try:
-            model_name = job.get("model") or DEFAULT_MODEL
-            language = job.get("language") or "fr"
-            speaker_input = job.get("speaker")
-            speaker_real = job.get("speaker_real", None)
-            available = getattr(tts_obj, "speakers", []) or getattr(tts_obj, "voices", []) or []
+    try:
+        # --- LOGIQUE D'ALIAS SIMPLIFIÉE ---
+        logger.info("Resolving speaker alias: '%s'", job.speaker)
+        if job.speaker:
+            # Simple, rapide, efficace.
+            job.speaker_real = speaker_map.get(job.speaker)
+        
+        if job.speaker and not job.speaker_real:
+            logger.warning("Alias '%s' not found in speaker map. Will use model default.", job.speaker)
+        logger.info("Resolved speaker to real ID: '%s'", job.speaker_real)
+        # --- FIN DE LA LOGIQUE D'ALIAS ---
 
-            raw_aliases = load_json(RAW_ALIASES_FILE)
-            resolved_map = load_json(RESOLVED_ALIASES_FILE)
+        logger.info("Starting audio synthesis for job %s...", job.id)
+        synth_audio(tts_obj, job, wav_out)
+        
+        if not wav_out.exists() or wav_out.stat().st_size == 0:
+            raise RuntimeError("Synthesis finished but output file is missing or empty.")
 
-            if speaker_real is None and speaker_input:
-                if speaker_input in available:
-                    speaker_real = speaker_input
-                else:
-                    for r, display in resolved_map.items():
-                        if _normalize_text(display) == _normalize_text(speaker_input):
-                            speaker_real = r
-                            break
-                if not speaker_real:
-                    for raw_key, display in raw_aliases.items():
-                        if _normalize_text(raw_key) == _normalize_text(speaker_input) or _normalize_text(display) == _normalize_text(speaker_input):
-                            matched = fuzzy_match_key_to_available(raw_key, available)
-                            if matched:
-                                speaker_real = matched
-                                break
-                if not speaker_real:
-                    speaker_real = fuzzy_match_key_to_available(speaker_input, available)
+        if job.format != "wav":
+            logger.info("Converting %s to %s...", wav_out, job.format)
+            AudioSegment.from_wav(wav_out).export(final_out_path, format=job.format)
+            wav_out.unlink()
+        
+        logger.info("✅ Job %s completed. Output: %s", job.id, final_out_path)
+        atomic_write_json(status_path, {
+            "job_id": job.id, "state": "done", "ts": time.time(),
+            "output": str(final_out_path), "speaker_real": job.speaker_real
+        })
+        job_path.unlink()
 
-            if raw_aliases and available:
-                discovered = {}
-                for raw_key, display in raw_aliases.items():
-                    matched = fuzzy_match_key_to_available(raw_key, available)
-                    if matched and matched not in resolved_map:
-                        discovered[matched] = display
-                if discovered:
-                    resolved_map.update(discovered)
-                    atomic_write_json(RESOLVED_ALIASES_FILE, resolved_map)
-                    logger.info("Added %d new resolved aliases to %s", len(discovered), RESOLVED_ALIASES_FILE)
+    except Exception as e:
+        logger.exception("🔴 Job %s failed.", job.id)
+        atomic_write_json(status_path, {
+            "job_id": job.id, "state": "error", "ts": time.time(),
+            "message": str(e), "trace": traceback.format_exc()
+        })
 
-            synth_sync(tts_obj, job.get("text", ""), wav_out, model_name, language, job.get("speaker_wav"), speaker_real, job.get("options"))
-
-            fmt = job.get("format", "wav").lower()
-            out_path = wav_out
-            if fmt != "wav":
-                try:
-                    AudioSegment.from_wav(wav_out).export(mp3_out, format="mp3")
-                    out_path = mp3_out
-                    os.remove(wav_out)
-                except Exception:
-                    logger.exception("mp3 conversion failed")
-                    atomic_write_json(status_path, {"job_id": job_id, "state": "error", "ts": time.time(), "message": "mp3 conversion failed"})
-                    return
-
-            atomic_write_json(status_path, {"job_id": job_id, "state": "done", "ts": time.time(), "output": out_path, "speaker_real": speaker_real})
-            logger.info("Job %s done -> %s (speaker_real=%s)", job_id, out_path, speaker_real)
-        except Exception as e:
-            logger.exception("Job %s failed", job_id)
-            atomic_write_json(status_path, {"job_id": job_id, "state": "error", "ts": time.time(), "message": str(e), "trace": traceback.format_exc()})
-        finally:
-            # Nouveau : no delete if error (keep .inprogress for debug)
-            if os.path.exists(status_path):
-                with open(status_path, "r") as f:
-                    status = json.load(f)
-                if status.get("state") == "done":
-                    try:
-                        os.remove(path)
-                        logger.info("Cleaned processed job %s", path)
-                    except Exception:
-                        pass
-            else:
-                logger.warning("No status for %s - keeping .inprogress for debug", path)
 
 def main():
-    logger.info("Starting worker — jobs dir: %s, outputs: %s, model: %s", JOBS_DIR, OUTPUT_DIR, DEFAULT_MODEL)
-    tts_obj = TTS(DEFAULT_MODEL)
-    logger.info("Model loaded; speakers: %d", len(getattr(tts_obj, "speakers", []) or []))
+    logger.info("Starting worker — Jobs: %s, Outputs: %s, Model: %s", JOBS_DIR, OUTPUT_DIR, DEFAULT_MODEL)
+    
+    # Charger la carte d'alias une seule fois au démarrage
+    if not SPEAKER_MAP_FILE.exists():
+        logger.error("FATAL: Speaker map file not found at %s. Run sync_aliases.py first.", SPEAKER_MAP_FILE)
+        return
+    speaker_map = json.loads(SPEAKER_MAP_FILE.read_text(encoding="utf-8"))
+    logger.info("Loaded %d speaker aliases from %s", len(speaker_map), SPEAKER_MAP_FILE)
+    
+    try:
+        tts_obj = TTS(DEFAULT_MODEL)
+        logger.info("Model loaded; %d speakers available.", len(getattr(tts_obj, "speakers", [])))
+    except Exception:
+        logger.exception("FATAL: Could not load TTS model. Exiting.")
+        return
+
     while True:
         try:
-            candidates = sorted(Path(JOBS_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime)
-            for p in candidates:
-                inprog = p.with_suffix(".inprogress")
-                try:
-                    os.replace(p, inprog)
-                    logger.info("Claimed job %s as %s", p, inprog)  # Nouveau log
-                    process_job_file(str(inprog), tts_obj)
-                except FileNotFoundError:
-                    continue
-                except Exception:
-                    logger.exception("Failed processing %s", p)
-            time.sleep(POLL_INTERVAL)
+            # ... (la boucle de recherche de jobs reste identique) ...
+            candidates = [p for p in JOBS_DIR.glob("*.json") if not p.name.startswith('.') and not p.name.endswith(('.status.json', '.inprogress'))]
+            if not candidates:
+                time.sleep(POLL_INTERVAL); continue
+            
+            job_file = sorted(candidates, key=lambda p: p.stat().st_mtime)[0]
+            
+            with job_lock:
+                if not job_file.exists(): continue
+                in_progress_path = job_file.with_suffix(".inprogress")
+                job_file.rename(in_progress_path)
+                # On passe la carte d'alias à la fonction de traitement
+                process_job_file(in_progress_path, tts_obj, speaker_map)
+
         except KeyboardInterrupt:
-            logger.info("Exiting worker")
-            break
+            logger.info("Worker shutting down."); break
         except Exception:
-            logger.exception("Main loop error")
-            time.sleep(POLL_INTERVAL)
+            logger.exception("An unexpected error occurred in the main loop."); time.sleep(POLL_INTERVAL * 5)
 
 if __name__ == "__main__":
     main()
