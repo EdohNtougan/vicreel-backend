@@ -1,4 +1,4 @@
-# app.py — VicReel (Version Finale Sécurisée avec CORS et gestion des textes longs)
+# app.py — VicReel (Version Finale Complète avec Clonage de Voix Sécurisé)
 import os
 import uuid
 import json
@@ -9,17 +9,17 @@ from pathlib import Path
 from typing import Optional, Dict, List, Iterable
 from collections import deque
 
-# --- Import de NLTK ---
 import nltk
 from nltk.tokenize import sent_tokenize
-
-from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, status
+from fastapi import FastAPI, Request, BackgroundTasks, Depends, HTTPException, status, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+# --- MODIFIÉ : Import de 'validator' de Pydantic et 'storage' de google.cloud ---
+from pydantic import BaseModel, Field, validator
 from pydub import AudioSegment
+from google.cloud import storage
 
 # --- Configuration ---
 API_KEY = os.getenv("VICREEL_API_KEY", "vicreel_secret_20002025")
@@ -34,6 +34,21 @@ PERSIST_OUTPUT_MAX_AGE = int(os.getenv("VICREEL_OUTPUT_MAX_AGE", str(60 * 10))) 
 
 SUPPORTED_LANGUAGES = ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko"]
 
+# --- NOUVEAU : Configuration Google Cloud Storage ---
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
+storage_client = None
+bucket = None
+if GCS_BUCKET_NAME:
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        logger.info(f"Connecté au bucket Google Cloud Storage : {GCS_BUCKET_NAME}")
+    except Exception as e:
+        logger.exception("Échec de la connexion à GCS. Le clonage de voix sera désactivé.")
+        bucket = None
+else:
+    logger.warning("GCS_BUCKET_NAME n'est pas configuré. Le clonage de voix sera désactivé.")
+
 # --- Initialisation ---
 OUTPUT_DIR.mkdir(exist_ok=True)
 JOBS_DIR.mkdir(exist_ok=True)
@@ -44,33 +59,37 @@ logger = logging.getLogger("vicreel-hybrid")
 
 app = FastAPI(title="VicReel - Hybrid TTS API")
 
-# --- MODIFIÉ : Configuration de sécurité CORS ---
-# Liste des domaines autorisés à appeler votre API
+# --- Configuration de sécurité CORS ---
 ALLOWED_ORIGINS_STR = os.getenv("VICREEL_ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
-
 if not ALLOWED_ORIGINS:
-    # En développement, autoriser les serveurs locaux. En production, cette variable DOIT être définie.
     ALLOWED_ORIGINS = ["http://localhost", "http://localhost:8080", "http://localhost:3000", "http://127.0.0.1:8080"]
     logger.warning(f"VICREEL_ALLOWED_ORIGINS non définie. Utilisation des valeurs par défaut pour le développement : {ALLOWED_ORIGINS}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+# --- MODIFIÉ : Ajout de la méthode DELETE pour la suppression des voix ---
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
-# --- Modèles Pydantic ---
+# --- MODIFIÉ : Modèles Pydantic avec validateur pour le clonage ---
 class TTSRequest(BaseModel):
     text: str = Field(..., max_length=MAX_TEXT_LENGTH)
-    speaker: str
+    speaker: Optional[str] = None
+    speaker_wav_id: Optional[str] = None
     format: str = Field("mp3", pattern="^(wav|mp3)$")
     language: Optional[str] = "fr"
     split_long_text: bool = Field(True, description="Découper le texte en phrases pour les longues synthèses.")
+
+    @validator('speaker_wav_id', always=True)
+    def check_speaker_exclusive(cls, v, values):
+        """Valide qu'un et un seul type de speaker est fourni."""
+        speaker_provided = 'speaker' in values and values['speaker'] is not None
+        speaker_wav_provided = v is not None
+
+        if speaker_provided and speaker_wav_provided:
+            raise ValueError("Fournir soit 'speaker', soit 'speaker_wav_id', mais pas les deux.")
+        if not speaker_provided and not speaker_wav_provided:
+            raise ValueError("Un 'speaker' (prédéfini) ou un 'speaker_wav_id' (cloné) est requis.")
+        return v
 
 # --- Fonctions et Classes Conservées (Sécurité, Métriques, Rate Limit, etc.) ---
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
@@ -84,8 +103,7 @@ _rate_limit_lock = asyncio.Lock()
 async def check_rate_limit(api_key_value: str):
     key = api_key_value or "ANON"
     now = time.time()
-    RATE_LIMIT_WINDOW = 60
-    RATE_LIMIT_MAX = 30
+    RATE_LIMIT_WINDOW = 60; RATE_LIMIT_MAX = 30
     async with _rate_limit_lock:
         dq = _rate_limit_store.setdefault(key, deque())
         while dq and dq[0] <= now - RATE_LIMIT_WINDOW: dq.popleft()
@@ -100,8 +118,7 @@ if not SPEAKER_MAP: logger.warning("Fichier speaker_map.json non trouvé ou vide
 try:
     nltk.data.find('tokenizers/punkt')
 except nltk.downloader.DownloadError:
-    logger.info("Téléchargement du tokenizer NLTK 'punkt'...")
-    nltk.download('punkt')
+    logger.info("Téléchargement du tokenizer NLTK 'punkt'..."); nltk.download('punkt')
 
 def split_text_into_chunks(text: str, max_chars: int = 250) -> List[str]:
     sentences = sent_tokenize(text, language='french' if 'fr' in text.lower() else 'english')
@@ -115,7 +132,7 @@ def split_text_into_chunks(text: str, max_chars: int = 250) -> List[str]:
     if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
-# --- Tâche de Synthèse en Arrière-Plan ---
+# --- Tâche de Synthèse en Arrière-Plan (mise à jour pour le clonage) ---
 def run_synthesis_task(job_id: str, job_data: dict):
     status_path = JOBS_DIR / f"{job_id}.status.json"
     
@@ -125,13 +142,28 @@ def run_synthesis_task(job_id: str, job_data: dict):
         if output_path: status_content["output"] = str(output_path)
         status_path.write_text(json.dumps(status_content, indent=2), encoding="utf-8")
 
+    speaker_ref_path_temp = None
     try:
         write_status("started", "Chargement du modèle TTS...")
         from TTS.api import TTS
         
         tts = TTS(DEFAULT_MODEL)
-        real_speaker_name = SPEAKER_MAP.get(job_data["speaker"])
-        if not real_speaker_name: raise ValueError(f"Alias '{job_data['speaker']}' non trouvé.")
+        
+        speaker_arg, speaker_wav_arg = None, None
+        cloned_voice_id = job_data.get("speaker_wav_id")
+        
+        if cloned_voice_id:
+            if not bucket: raise ConnectionError("Le service de clonage (GCS) n'est pas configuré.")
+            blob = bucket.blob(cloned_voice_id)
+            if not blob.exists(): raise FileNotFoundError(f"L'ID de voix clonée '{cloned_voice_id}' n'existe pas.")
+            
+            speaker_ref_path_temp = OUTPUT_DIR / f"temp_{job_id}_{cloned_voice_id}"
+            blob.download_to_filename(speaker_ref_path_temp)
+            speaker_wav_arg = str(speaker_ref_path_temp)
+        else:
+            predefined_speaker_alias = job_data["speaker"]
+            speaker_arg = SPEAKER_MAP.get(predefined_speaker_alias)
+            if not speaker_arg: raise ValueError(f"L'alias de speaker '{predefined_speaker_alias}' est inconnu.")
 
         text_to_synth, chunk_files = job_data["text"], []
         final_output_path = None
@@ -145,7 +177,7 @@ def run_synthesis_task(job_id: str, job_data: dict):
                 status_message = f"Synthèse du segment {i+1}/{total_chunks}..."
                 write_status("running", status_message)
                 logger.info("Job %s: %s", job_id, status_message)
-                tts.tts_to_file(text=chunk, file_path=str(chunk_wav_path), speaker=real_speaker_name, language=job_data["language"])
+                tts.tts_to_file(text=chunk, file_path=str(chunk_wav_path), speaker=speaker_arg, speaker_wav=speaker_wav_arg, language=job_data["language"])
             
             write_status("running", "Assemblage des segments audio...")
             combined_audio = AudioSegment.empty()
@@ -158,8 +190,8 @@ def run_synthesis_task(job_id: str, job_data: dict):
             for chunk_file in chunk_files: chunk_file.unlink()
         else:
             final_wav_path = OUTPUT_DIR / f"{job_id}.wav"
-            write_status("running", f"Synthèse en cours avec la voix '{real_speaker_name}'...")
-            tts.tts_to_file(text=text_to_synth, file_path=str(final_wav_path), speaker=real_speaker_name, language=job_data["language"])
+            write_status("running", "Synthèse en cours...")
+            tts.tts_to_file(text=text_to_synth, file_path=str(final_wav_path), speaker=speaker_arg, speaker_wav=speaker_wav_arg, language=job_data["language"])
             final_output_path = final_wav_path
             
         if job_data["format"] == "mp3":
@@ -174,6 +206,9 @@ def run_synthesis_task(job_id: str, job_data: dict):
     except Exception as e:
         logger.exception("🔴 Le job %s a échoué.", job_id)
         write_status("error", str(e))
+    finally:
+        if speaker_ref_path_temp and speaker_ref_path_temp.exists():
+            speaker_ref_path_temp.unlink()
 
 # --- Nettoyage des anciens fichiers ---
 def cleanup_old_files():
@@ -199,51 +234,73 @@ async def list_voices():
 
 @app.get("/languages", dependencies=[Depends(verify_api_key)])
 async def list_languages():
-    """Retourne la liste des codes de langue supportés par le modèle XTTSv2."""
     return {"languages": SUPPORTED_LANGUAGES}
+
+# --- NOUVEAU : Routes pour le clonage de voix ---
+@app.post("/voices/clone", dependencies=[Depends(verify_api_key)])
+async def clone_voice(user_id: str = Form(...), file: UploadFile = File(...)):
+    if not bucket: raise HTTPException(status_code=503, detail="Le service de clonage est désactivé.")
+    if not file.content_type or not file.content_type.startswith("audio/"):
+        raise HTTPException(status_code=400, detail="Seuls les fichiers audio sont acceptés.")
+
+    cloned_voice_id = f"user_{user_id}_{uuid.uuid4().hex[:12]}.wav"
+    blob = bucket.blob(cloned_voice_id)
+    try:
+        blob.upload_from_file(file.file)
+        logger.info(f"Voix clonée pour l'utilisateur '{user_id}' sauvegardée sur GCS avec l'ID : {cloned_voice_id}")
+    except Exception:
+        logger.exception("Erreur lors de l'upload vers GCS."); raise HTTPException(status_code=500, detail="Impossible de sauvegarder le fichier de voix.")
+    return {"speaker_wav_id": cloned_voice_id, "message": "Fichier reçu. Utilisez cet ID pour la synthèse."}
+
+@app.delete("/voices/clone/{speaker_wav_id}", status_code=204, dependencies=[Depends(verify_api_key)])
+async def delete_cloned_voice(speaker_wav_id: str, request: Request):
+    user_id = request.headers.get("x-user-id")
+    if not user_id: raise HTTPException(status_code=400, detail="L'en-tête 'x-user-id' est requis pour l'autorisation.")
+    if not bucket: raise HTTPException(status_code=503, detail="Le service de clonage est désactivé.")
+
+    if not speaker_wav_id.startswith(f"user_{user_id}_"):
+        logger.warning(f"Tentative de suppression non autorisée par l'utilisateur '{user_id}' sur la voix '{speaker_wav_id}'.")
+        raise HTTPException(status_code=403, detail="Vous n'êtes pas autorisé à supprimer cette ressource.")
+
+    try:
+        blob = bucket.blob(speaker_wav_id)
+        if not blob.exists(): raise HTTPException(status_code=404, detail="La voix clonée spécifiée n'existe pas.")
+        blob.delete()
+        logger.info(f"Voix clonée '{speaker_wav_id}' supprimée avec succès par l'utilisateur '{user_id}'.")
+    except HTTPException: raise
+    except Exception as e:
+        logger.exception(f"Erreur lors de la suppression de la voix '{speaker_wav_id}' sur GCS."); raise HTTPException(status_code=500, detail="Erreur interne lors de la suppression de la voix.")
 
 @app.get("/jobs/{job_id}/status", dependencies=[Depends(verify_api_key)])
 async def get_job_status(job_id: str, request: Request):
     status_file = JOBS_DIR / f"{job_id}.status.json"
-    if not re.match(r"^[a-zA-Z0-9_-]+$", job_id):
-        raise HTTPException(status_code=400, detail="Job ID invalide.")
-    if not status_file.exists():
-        return {"job_id": job_id, "state": "pending"}
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", job_id): raise HTTPException(status_code=400, detail="Job ID invalide.")
+    if not status_file.exists(): return {"job_id": job_id, "state": "pending"}
     try:
         status_data = json.loads(status_file.read_text(encoding="utf-8"))
         if status_data.get("state") == "done":
             output_filename = Path(status_data["output"]).name
             status_data["output_url"] = str(request.url_for('outputs', path=output_filename))
         return status_data
-    except Exception:
-        raise HTTPException(status_code=500, detail="Impossible de lire le fichier de statut.")
+    except Exception: raise HTTPException(status_code=500, detail="Impossible de lire le fichier de statut.")
 
 _cleanup_counter = 0
 @app.post("/tts", status_code=202, dependencies=[Depends(verify_api_key)])
 async def submit_tts_job(request: Request, tts_request: TTSRequest, background_tasks: BackgroundTasks):
     global _cleanup_counter
-    api_key = request.headers.get("x-api-key")
-    await check_rate_limit(api_key)
-    METRICS["requests_total"] += 1
+    api_key = request.headers.get("x-api-key"); await check_rate_limit(api_key); METRICS["requests_total"] += 1
 
-    if tts_request.speaker not in SPEAKER_MAP:
-        raise HTTPException(status_code=400, detail=f"Speaker '{tts_request.speaker}' inconnu.")
-
+    # La validation se fait maintenant automatiquement par Pydantic. Si le code arrive ici, la requête est valide.
+    
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     job_data = tts_request.dict()
-
     background_tasks.add_task(run_synthesis_task, job_id, job_data)
 
     _cleanup_counter += 1
     if _cleanup_counter >= 20:
-        background_tasks.add_task(cleanup_old_files)
-        _cleanup_counter = 0
+        background_tasks.add_task(cleanup_old_files); _cleanup_counter = 0
 
     status_url = str(request.url_for('get_job_status', job_id=job_id))
     logger.info("Job %s soumis. Statut disponible à: %s", job_id, status_url)
     
-    return {
-        "job_id": job_id,
-        "status_url": status_url,
-        "message": "Job soumis. Vérifiez l'URL de statut pour suivre la progression."
-    }
+    return {"job_id": job_id, "status_url": status_url, "message": "Job soumis. Vérifiez l'URL de statut pour suivre la progression."}
