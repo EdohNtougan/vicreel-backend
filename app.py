@@ -1,4 +1,4 @@
-# app.py — VicReel (Version Hybride Finale avec gestion des textes longs et route /languages)
+# app.py — VicReel (Version Finale Sécurisée avec CORS et gestion des textes longs)
 import os
 import uuid
 import json
@@ -7,6 +7,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Iterable
+from collections import deque
 
 # --- Import de NLTK ---
 import nltk
@@ -31,7 +32,6 @@ DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/mult
 MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "5000"))
 PERSIST_OUTPUT_MAX_AGE = int(os.getenv("VICREEL_OUTPUT_MAX_AGE", str(60 * 10))) # 10 minutes
 
-# --- NOUVEAU : Liste des langues supportées ---
 SUPPORTED_LANGUAGES = ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko"]
 
 # --- Initialisation ---
@@ -43,7 +43,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger("vicreel-hybrid")
 
 app = FastAPI(title="VicReel - Hybrid TTS API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- MODIFIÉ : Configuration de sécurité CORS ---
+# Liste des domaines autorisés à appeler votre API
+ALLOWED_ORIGINS_STR = os.getenv("VICREEL_ALLOWED_ORIGINS", "")
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(",") if origin.strip()]
+
+if not ALLOWED_ORIGINS:
+    # En développement, autoriser les serveurs locaux. En production, cette variable DOIT être définie.
+    ALLOWED_ORIGINS = ["http://localhost", "http://localhost:8080", "http://localhost:3000", "http://127.0.0.1:8080"]
+    logger.warning(f"VICREEL_ALLOWED_ORIGINS non définie. Utilisation des valeurs par défaut pour le développement : {ALLOWED_ORIGINS}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 # --- Modèles Pydantic ---
@@ -179,7 +197,6 @@ def get_metrics(): return METRICS
 async def list_voices():
     return [{"id": alias, "name": alias.replace("_", " ").title()} for alias in sorted(SPEAKER_MAP.keys())]
 
-# --- NOUVEAU : Route pour lister les langues ---
 @app.get("/languages", dependencies=[Depends(verify_api_key)])
 async def list_languages():
     """Retourne la liste des codes de langue supportés par le modèle XTTSv2."""
