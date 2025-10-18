@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+nltk
 coqui-tts==0.27.2
 pydub
 soundfile
