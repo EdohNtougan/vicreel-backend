@@ -1,11 +1,11 @@
-# app.py — VicReel
+# app.py — VicReel (Version Finale de Production - Phase 1)
 import os
 import uuid
 import json
 import time
 import re
 import logging
-import asyncio # AJOUTÉ : Import manquant pour le Lock asynchrone
+import asyncio
 from pathlib import Path
 from typing import Optional, Dict, List, Iterable
 from collections import deque
@@ -32,9 +32,11 @@ DEFAULT_MODEL = os.getenv("VICREEL_DEFAULT_MODEL", "tts_models/multilingual/mult
 
 MAX_TEXT_LENGTH = int(os.getenv("VICREEL_MAX_TEXT_LENGTH", "5000"))
 PERSIST_OUTPUT_MAX_AGE = int(os.getenv("VICREEL_OUTPUT_MAX_AGE", str(60 * 10))) # 10 minutes
+# NOUVEAU : Durée de vie du cache configurable
+CACHE_MAX_AGE = int(os.getenv("CACHE_MAX_AGE", str(24 * 60 * 60))) # 24 heures par défaut
+
 MAX_CLONE_FILE_SIZE = 10 * 1024 * 1024 
 
-# MODIFIÉ : Constantes du Rate Limiter externalisées
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))
 
@@ -44,10 +46,9 @@ SUPPORTED_LANGUAGES = ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl
 tts_model = None
 tts_lock = Lock()
 
-# AJOUTÉ : Cache en mémoire pour les voix clonées
+# Cache en mémoire pour les voix clonées
 CLONED_VOICE_CACHE: Dict[str, Path] = {}
 CLONED_VOICE_CACHE_LOCK = Lock()
-
 
 def get_tts_instance():
     """Charge le modèle TTS une seule fois et le réutilise de manière sécurisée."""
@@ -91,7 +92,7 @@ if not ALLOWED_ORIGINS:
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
-# --- MODIFIÉ : Modèles Pydantic avec validateur de langue ---
+# --- Modèles Pydantic avec validateur de langue ---
 class TTSRequest(BaseModel):
     text: str = Field(..., max_length=MAX_TEXT_LENGTH)
     speaker: Optional[str] = None
@@ -111,7 +112,6 @@ class TTSRequest(BaseModel):
             raise ValueError("Un 'speaker' (prédéfini) ou un 'speaker_wav_id' (cloné) est requis.")
         return v
     
-    # AJOUTÉ : Validateur pour le champ 'language'
     @validator('language')
     def language_is_supported(cls, v):
         """Valide que la langue demandée est dans notre liste de langues supportées."""
@@ -129,7 +129,6 @@ METRICS = {"requests_total": 0, "success_total": 0, "error_total": 0}
 _rate_limit_store: Dict[str, deque] = {}; _rate_limit_lock = asyncio.Lock()
 async def check_rate_limit(api_key_value: str):
     key = api_key_value or "ANON"; now = time.time()
-    # MODIFIÉ : Les constantes sont maintenant lues depuis la configuration globale
     async with _rate_limit_lock:
         dq = _rate_limit_store.setdefault(key, deque())
         while dq and dq[0] <= now - RATE_LIMIT_WINDOW: dq.popleft()
@@ -156,7 +155,7 @@ def split_text_into_chunks(text: str, max_chars: int) -> List[str]:
     if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
-# --- MODIFIÉ : Tâche de Synthèse en Arrière-Plan avec cache ---
+# --- Tâche de Synthèse en Arrière-Plan avec cache ---
 def run_synthesis_task(job_id: str, job_data: dict):
     status_path = JOBS_DIR / f"{job_id}.status.json"
     def write_status(state: str, message: Optional[str] = None, output_path: Optional[str] = None):
@@ -173,7 +172,6 @@ def run_synthesis_task(job_id: str, job_data: dict):
         cloned_voice_id = job_data.get("speaker_wav_id")
         
         if cloned_voice_id:
-            # --- BLOC MODIFIÉ AVEC CACHE ---
             with CLONED_VOICE_CACHE_LOCK:
                 if cloned_voice_id in CLONED_VOICE_CACHE and CLONED_VOICE_CACHE[cloned_voice_id].exists():
                     logger.info(f"Utilisation de la voix clonée '{cloned_voice_id}' depuis le cache.")
@@ -188,7 +186,6 @@ def run_synthesis_task(job_id: str, job_data: dict):
                     blob.download_to_filename(cached_path)
                     CLONED_VOICE_CACHE[cloned_voice_id] = cached_path
                     speaker_wav_arg = str(cached_path)
-            # --- FIN DU BLOC MODIFIÉ ---
         else:
             predefined_speaker_alias = job_data["speaker"]
             speaker_arg = SPEAKER_MAP.get(predefined_speaker_alias)
@@ -231,18 +228,36 @@ def run_synthesis_task(job_id: str, job_data: dict):
     except Exception as e:
         logger.exception("🔴 Le job %s a échoué.", job_id); write_status("error", str(e))
     finally:
-        # MODIFIÉ : Le nettoyage des fichiers temporaires de voix clonées n'est plus nécessaire
-        # car ils sont maintenant conservés dans le cache.
         pass
 
-# --- Nettoyage des anciens fichiers ---
+# --- MODIFIÉ : Nettoyage des anciens fichiers ET du cache ---
 def cleanup_old_files():
+    """Nettoie les vieux fichiers de sortie et les vieux fichiers du cache."""
     try:
         now = time.time()
-        # On ne nettoie pas les fichiers du cache de voix
-        for file in [p for p in OUTPUT_DIR.iterdir() if p.is_file() and not p.name.startswith("cached_")]:
-            if now - file.stat().st_mtime > PERSIST_OUTPUT_MAX_AGE: file.unlink()
-    except Exception: logger.exception("Le nettoyage des anciens fichiers a échoué.")
+        for file in OUTPUT_DIR.iterdir():
+            if not file.is_file():
+                continue
+
+            file_age = now - file.stat().st_mtime
+            
+            # Vérifie si c'est un fichier de cache
+            if file.name.startswith("cached_"):
+                if file_age > CACHE_MAX_AGE:
+                    logger.info(f"Nettoyage du fichier cache expiré : {file.name}")
+                    # On le retire aussi du dictionnaire en mémoire pour forcer un re-téléchargement
+                    with CLONED_VOICE_CACHE_LOCK:
+                        cache_key = file.name[len("cached_"):]
+                        if cache_key in CLONED_VOICE_CACHE:
+                            del CLONED_VOICE_CACHE[cache_key]
+                    file.unlink()
+            # Sinon, c'est un fichier de sortie normal
+            else:
+                if file_age > PERSIST_OUTPUT_MAX_AGE:
+                    file.unlink()
+
+    except Exception:
+        logger.exception("Le nettoyage des anciens fichiers a échoué.")
 
 # --- Routes de l'API ---
 @app.get("/"); def root(): return {"message": "API VicReel TTS - Hybride"}
@@ -251,37 +266,25 @@ def cleanup_old_files():
 @app.get("/voices", dependencies=[Depends(verify_api_key)]); async def list_voices(): return [{"id": alias, "name": alias.replace("_", " ").title()} for alias in sorted(SPEAKER_MAP.keys())]
 @app.get("/languages", dependencies=[Depends(verify_api_key)]); async def list_languages(): return {"languages": SUPPORTED_LANGUAGES}
 
-# AJOUTÉ : Nouvelle route pour lister les voix clonées d'un utilisateur
 @app.get("/voices/cloned", dependencies=[Depends(verify_api_key)])
 async def list_cloned_voices(request: Request):
-    """Liste les voix clonées appartenant à un utilisateur."""
     user_id = request.headers.get("x-user-id")
-    if not user_id:
-        raise HTTPException(status_code=400, detail="L'en-tête 'x-user-id' est requis.")
-    if not bucket:
-        raise HTTPException(status_code=503, detail="Le service de clonage est désactivé.")
-
+    if not user_id: raise HTTPException(status_code=400, detail="L'en-tête 'x-user-id' est requis.")
+    if not bucket: raise HTTPException(status_code=503, detail="Le service de clonage est désactivé.")
     try:
-        # Liste les fichiers sur GCS qui commencent par le préfixe de l'utilisateur
-        prefix = f"user_{user_id}_"
-        blobs = storage_client.list_blobs(bucket, prefix=prefix)
-        
-        user_voices = [{"speaker_wav_id": blob.name} for blob in blobs]
-        return user_voices
+        prefix = f"user_{user_id}_"; blobs = storage_client.list_blobs(bucket, prefix=prefix)
+        return [{"speaker_wav_id": blob.name} for blob in blobs]
     except Exception as e:
         logger.exception(f"Erreur lors du listage des voix pour l'utilisateur '{user_id}'.")
         raise HTTPException(status_code=500, detail="Impossible de récupérer la liste des voix clonées.")
-
 
 @app.post("/voices/clone", dependencies=[Depends(verify_api_key)])
 async def clone_voice(user_id: str = Form(...), file: UploadFile = File(...)):
     if not bucket: raise HTTPException(status_code=503, detail="Le service de clonage est désactivé.")
     if not file.content_type or not file.content_type.startswith("audio/"): raise HTTPException(status_code=400, detail="Seuls les fichiers audio sont acceptés.")
-
     file_content = await file.read()
     if len(file_content) > MAX_CLONE_FILE_SIZE:
         raise HTTPException(status_code=413, detail=f"Le fichier est trop volumineux. La taille maximale est de {MAX_CLONE_FILE_SIZE / 1024 / 1024:.1f} Mo.")
-    
     cloned_voice_id = f"user_{user_id}_{uuid.uuid4().hex[:12]}.wav"; blob = bucket.blob(cloned_voice_id)
     try:
         blob.upload_from_string(file_content, content_type=file.content_type)
@@ -302,10 +305,16 @@ async def delete_cloned_voice(speaker_wav_id: str, request: Request):
         blob = bucket.blob(speaker_wav_id)
         if not blob.exists(): raise HTTPException(status_code=404, detail="La voix clonée spécifiée n'existe pas.")
         blob.delete()
+        # NOUVEAU : On supprime aussi le fichier du cache local s'il existe
+        with CLONED_VOICE_CACHE_LOCK:
+            if speaker_wav_id in CLONED_VOICE_CACHE:
+                cached_file = CLONED_VOICE_CACHE.pop(speaker_wav_id)
+                if cached_file.exists():
+                    cached_file.unlink()
         logger.info(f"Voix clonée '{speaker_wav_id}' supprimée avec succès par l'utilisateur '{user_id}'.")
     except HTTPException: raise
     except Exception as e:
-        logger.exception(f"Erreur lors de la suppression de la voix '{speaker_wav_id}' sur GCS."); raise HTTPException(status_code=500, detail="Erreur interne lors de la suppression de la voix.")
+        logger.exception(f"Erreur lors de la suppression de la voix '{speaker_wav_id}'."); raise HTTPException(status_code=500, detail="Erreur interne lors de la suppression de la voix.")
 
 @app.get("/jobs/{job_id}/status", dependencies=[Depends(verify_api_key)])
 async def get_job_status(job_id: str, request: Request):
@@ -334,4 +343,3 @@ async def submit_tts_job(request: Request, tts_request: TTSRequest, background_t
     status_url = str(request.url_for('get_job_status', job_id=job_id))
     logger.info("Job %s soumis. Statut disponible à: %s", job_id, status_url)
     return {"job_id": job_id, "status_url": status_url, "message": "Job soumis. Vérifiez l'URL de statut pour suivre la progression."}
-
