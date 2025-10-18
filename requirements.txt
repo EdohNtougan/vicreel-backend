@@ -8,3 +8,4 @@ soundfile
 python-multipart
 torch
 torchaudio
+google-cloud-storage
