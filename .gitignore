@@ -1,9 +1,47 @@
+# # Fichiers et dossiers générés par Python
+# ---
+# Cache de l'interpréteur et bytecode
 __pycache__/
 *.pyc
+
+# Environnement virtuel
 venv/
+*.venv/
+ENV/
+
+# Fichiers de configuration d'environnement (contiennent des secrets)
 .env
+.env.*
+
+# # Fichiers générés par l'application VicReel
+# ---
+# Dossier des jobs en attente ou en cours. Ne doit pas être versionné.
+jobs/
+
+# Dossier des fichiers audio finaux.
 outputs/
+
+# # Fichiers générés par les outils de développement
+# ---
+# Fichiers de configuration de l'éditeur (VSCode, PyCharm, etc.)
+.vscode/
+.idea/
+
+# Fichiers système spécifiques à macOS
+.DS_Store
+
+# # Dépendances et modèles lourds
+# ---
+# Le dossier des modèles TTS s'il est téléchargé dans le projet.
+# NOTE : Si votre `requirements.txt` gère le téléchargement,
+# il est préférable de l'ignorer pour garder le dépôt léger.
 models/
+
+# # Types de fichiers spécifiques (facultatif mais propre)
+# ---
+# Ignore tous les fichiers audio à la racine s'il y en a par erreur
 *.wav
 *.mp3
-.DS_Store
+
+# Fichiers de log
+*.log
